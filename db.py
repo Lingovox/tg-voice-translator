@@ -3,17 +3,14 @@ from sqlalchemy import create_engine, Column, Integer, BigInteger, Boolean, Stri
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-
 Base = declarative_base()
 
 class User(Base):
     __tablename__ = "users"
-
     telegram_id = Column(BigInteger, primary_key=True)
     target_lang = Column(String(10), nullable=False, default="en")
     trial_left = Column(Integer, nullable=False, default=5)
     is_subscribed = Column(Boolean, nullable=False, default=False)
-
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
