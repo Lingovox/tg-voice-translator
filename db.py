@@ -1,26 +1,33 @@
 import os
-from sqlalchemy import create_engine, Column, Integer, BigInteger, Boolean, String, DateTime, func
-from sqlalchemy.orm import declarative_base, sessionmaker
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
-DATABASE_URL = os.environ.get("DATABASE_URL")
-Base = declarative_base()
 
-class User(Base):
-    __tablename__ = "users"
-    telegram_id = Column(BigInteger, primary_key=True)
-    target_lang = Column(String(10), nullable=False, default="en")
-    trial_left = Column(Integer, nullable=False, default=5)
-    is_subscribed = Column(Boolean, nullable=False, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+def _normalize_db_url(url: str) -> str:
+    """
+    Render часто даёт DATABASE_URL в формате:
+      postgres://user:pass@host:5432/db
+    SQLAlchemy предпочитает:
+      postgresql+psycopg2://...
+    """
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+psycopg2://", 1)
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
 
-def get_engine():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is not set")
-    return create_engine(DATABASE_URL, pool_pre_ping=True)
 
-engine = get_engine()
-SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL env var is required")
 
-def init_db():
-    Base.metadata.create_all(bind=engine)
+engine = create_engine(
+    _normalize_db_url(DATABASE_URL),
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+class Base(DeclarativeBase):
+    pass
