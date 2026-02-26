@@ -61,7 +61,7 @@ LANGS = {
     "es": "Español",
     "th": "ไทย",
     "vi": "Tiếng Việt",
-    "uz": "O‘zbek",
+    "fr": "Français",
     "tr": "Türkçe",
 }
 
