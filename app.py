@@ -1,16 +1,5 @@
 # app.py
 # Telegram Voice Translator + CryptoCloud minutes top-up (Render + FastAPI)
-# Env vars required:
-#   DATABASE_URL
-#   OPENAI_API_KEY
-#   TELEGRAM_BOT_TOKEN
-#   BASE_URL                         e.g. https://tg-voice-translator-1.onrender.com
-#   CRYPTOCLOUD_API_KEY
-#   CRYPTOCLOUD_SHOP_ID
-#   CRYPTOCLOUD_SECRET_KEY
-# Optional:
-#   TRIAL_LIMIT                      default 5
-#   ADMIN_ID                         your Telegram numeric id (for /stats)
 
 import base64
 import datetime as dt
@@ -19,12 +8,11 @@ import hashlib
 import json
 import os
 import time
-import urllib.parse
 from typing import Any, Dict, Optional, Tuple
 
 import requests
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse
 
 from sqlalchemy import (
     BigInteger,
@@ -54,15 +42,12 @@ CRYPTOCLOUD_SHOP_ID = os.environ.get("CRYPTOCLOUD_SHOP_ID", "").strip()
 CRYPTOCLOUD_SECRET_KEY = os.environ.get("CRYPTOCLOUD_SECRET_KEY", "").strip()
 
 TRIAL_LIMIT = int(os.environ.get("TRIAL_LIMIT", "5") or "5")
-ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()  # may be empty
+ADMIN_ID = os.environ.get("ADMIN_ID", "").strip()
 
-# CryptoCloud API base (can change if they use different host)
 CRYPTOCLOUD_API_BASE = os.environ.get("CRYPTOCLOUD_API_BASE", "https://api.cryptocloud.plus").rstrip("/")
 
-# Trial rule: 5 free messages, each <= 60 sec
 TRIAL_MAX_SECONDS_PER_MESSAGE = 60
 
-# Minutes packages (USD)
 PACKAGES = {
     "P30": {"usd": 3, "minutes": 30},
     "P60": {"usd": 8, "minutes": 60},
@@ -70,7 +55,7 @@ PACKAGES = {
     "P600": {"usd": 50, "minutes": 600},
 }
 
-# Language buttons (IMPORTANT: French is here; Uzbek removed)
+# Французский вернул, узбекский убрал
 LANGS = [
     ("English", "en"),
     ("Русский", "ru"),
@@ -104,13 +89,13 @@ class User(Base):
     __tablename__ = "users"
 
     telegram_id = Column(BigInteger, primary_key=True, index=True)
-    target_lang = Column(String, nullable=False, default="fr")  # default French
-    trial_left = Column(Integer, nullable=False, default=TRIAL_LIMIT)
-    is_subscribed = Column(Boolean, nullable=False, default=False)
+    target_lang = Column(String, nullable=False, default="fr")
 
-    # Kept for backward-compat with your earlier DB state
+    trial_left = Column(Integer, nullable=False, default=TRIAL_LIMIT)
+    # legacy column from earlier versions
     trial_messages = Column(Integer, nullable=False, default=TRIAL_LIMIT)
 
+    is_subscribed = Column(Boolean, nullable=False, default=False)
     balance_seconds = Column(Integer, nullable=False, default=0)
 
     created_at = Column(DateTime, default=dt.datetime.utcnow)
@@ -124,22 +109,22 @@ class Payment(Base):
     telegram_id = Column(BigInteger, nullable=False, index=True)
 
     order_id = Column(String, nullable=False, unique=True, index=True)
-    invoice_id = Column(String, nullable=True, index=True)  # short id like "BOVIBV5N" OR uuid
-    package_code = Column(String, nullable=False)  # P30/P60/...
+    # ВАЖНО: у тебя invoice_id NOT NULL -> значит мы обязаны вставлять его сразу
+    invoice_id = Column(String, nullable=False, index=True)
+
+    package_code = Column(String, nullable=False)
     amount_usd = Column(Integer, nullable=False)
 
-    status = Column(String, nullable=False, default="created")  # created/paid/failed/...
+    status = Column(String, nullable=False, default="created")
     created_at = Column(DateTime, default=dt.datetime.utcnow)
     updated_at = Column(DateTime, default=dt.datetime.utcnow, onupdate=dt.datetime.utcnow)
 
 
 def ensure_schema() -> None:
-    """Create tables and add missing columns safely."""
     Base.metadata.create_all(engine)
 
-    # Add columns if DB created earlier without them (cheap "migration")
+    # add missing columns if earlier DB was incomplete
     with engine.begin() as conn:
-        # users columns
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS target_lang varchar DEFAULT 'fr'"))
         conn.execute(text(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_left integer DEFAULT {TRIAL_LIMIT}"))
         conn.execute(text(f"ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_messages integer DEFAULT {TRIAL_LIMIT}"))
@@ -148,7 +133,6 @@ def ensure_schema() -> None:
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at timestamp without time zone DEFAULT NOW()"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at timestamp without time zone DEFAULT NOW()"))
 
-        # payments columns
         conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS telegram_id bigint"))
         conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS order_id varchar"))
         conn.execute(text("ALTER TABLE payments ADD COLUMN IF NOT EXISTS invoice_id varchar"))
@@ -167,13 +151,15 @@ ensure_schema()
 # -------------------------
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY is missing")
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 
 # -------------------------
 # Telegram helpers
 # -------------------------
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 
@@ -203,7 +189,6 @@ def answer_callback(callback_query_id: str, text_: str = "", show_alert: bool = 
 
 
 def build_home_keyboard(user_lang: str) -> dict:
-    # 2 columns languages + buy button
     rows = []
     for i in range(0, len(LANGS), 2):
         pair = LANGS[i : i + 2]
@@ -212,48 +197,35 @@ def build_home_keyboard(user_lang: str) -> dict:
             prefix = "✅ " if code == user_lang else ""
             row.append({"text": f"{prefix}{label}", "callback_data": f"lang_{code}"})
         rows.append(row)
-
     rows.append([{"text": "💳 Купить минуты", "callback_data": "open_buy"}])
     return {"inline_keyboard": rows}
 
 
 def build_buy_keyboard() -> dict:
-    rows = [
-        [{"text": "30 мин — $3", "callback_data": "buy_P30"}],
-        [{"text": "60 мин — $8", "callback_data": "buy_P60"}],
-        [{"text": "180 мин — $20", "callback_data": "buy_P180"}],
-        [{"text": "600 мин — $50", "callback_data": "buy_P600"}],
-        [{"text": "⬅️ Назад", "callback_data": "back_home"}],
-    ]
-    return {"inline_keyboard": rows}
+    return {
+        "inline_keyboard": [
+            [{"text": "30 мин — $3", "callback_data": "buy_P30"}],
+            [{"text": "60 мин — $8", "callback_data": "buy_P60"}],
+            [{"text": "180 мин — $20", "callback_data": "buy_P180"}],
+            [{"text": "600 мин — $50", "callback_data": "buy_P600"}],
+            [{"text": "⬅️ Назад", "callback_data": "back_home"}],
+        ]
+    }
 
 
 def fmt_balance_minutes(balance_seconds: int) -> int:
-    if balance_seconds <= 0:
-        return 0
-    # show whole minutes (rounded down)
-    return balance_seconds // 60
-
-
-def show_home(chat_id: int, user: User) -> None:
-    text_ = (
-        "🎙 Голосовой переводчик\n\n"
-        f"🌍 Язык перевода: {user.target_lang}\n"
-        f"🎁 Бесплатных переводов: {user.trial_left} (≤ {TRIAL_MAX_SECONDS_PER_MESSAGE} сек)\n"
-        f"💳 Баланс: {fmt_balance_minutes(user.balance_seconds)} мин\n\n"
-        "Запиши голосовое — я переведу и пришлю озвучку."
-    )
-    send_message(chat_id, text_, reply_markup=build_home_keyboard(user.target_lang))
+    return max(0, int(balance_seconds or 0) // 60)
 
 
 def get_or_create_user(db, telegram_id: int) -> User:
     user = db.query(User).filter(User.telegram_id == telegram_id).first()
     if user:
-        # keep backward-compat if trial_messages exists in old logic
-        if user.trial_left is None:
-            user.trial_left = TRIAL_LIMIT
         if user.target_lang is None:
             user.target_lang = "fr"
+        if user.trial_left is None:
+            user.trial_left = TRIAL_LIMIT
+        if user.trial_messages is None:
+            user.trial_messages = user.trial_left
         if user.balance_seconds is None:
             user.balance_seconds = 0
         db.commit()
@@ -272,14 +244,23 @@ def get_or_create_user(db, telegram_id: int) -> User:
     return user
 
 
+def show_home(chat_id: int, user: User) -> None:
+    text_ = (
+        "🎙 Голосовой переводчик\n\n"
+        f"🌍 Язык перевода: {user.target_lang}\n"
+        f"🎁 Бесплатных переводов: {user.trial_left} (≤ {TRIAL_MAX_SECONDS_PER_MESSAGE} сек)\n"
+        f"💳 Баланс: {fmt_balance_minutes(user.balance_seconds)} мин\n\n"
+        "Запиши голосовое — я переведу и пришлю озвучку."
+    )
+    send_message(chat_id, text_, reply_markup=build_home_keyboard(user.target_lang))
+
+
 def telegram_get_file_bytes(file_id: str) -> Tuple[bytes, str]:
-    # 1) getFile -> file_path
     r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30)
     j = r.json()
     if not j.get("ok"):
         raise RuntimeError(f"getFile failed: {j}")
     file_path = j["result"]["file_path"]
-    # 2) download
     file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
     data = requests.get(file_url, timeout=60).content
     filename = file_path.split("/")[-1]
@@ -287,7 +268,7 @@ def telegram_get_file_bytes(file_id: str) -> Tuple[bytes, str]:
 
 
 # -------------------------
-# Minimal HS256 JWT verify (no extra libs)
+# JWT verify (HS256)
 # -------------------------
 def b64url_decode(s: str) -> bytes:
     s += "=" * (-len(s) % 4)
@@ -295,37 +276,26 @@ def b64url_decode(s: str) -> bytes:
 
 
 def verify_jwt_hs256(token: str, secret: str) -> Dict[str, Any]:
-    """
-    Verifies HS256 JWT. Returns payload dict if valid, raises if invalid.
-    """
     parts = token.split(".")
     if len(parts) != 3:
         raise ValueError("Bad JWT format")
-
     header_b64, payload_b64, sig_b64 = parts
     signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
     sig = b64url_decode(sig_b64)
-
     expected = hmac.new(secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
     if not hmac.compare_digest(expected, sig):
         raise ValueError("JWT signature invalid")
-
     payload = json.loads(b64url_decode(payload_b64).decode("utf-8"))
-
-    # exp check (if present)
     exp = payload.get("exp")
     if exp is not None and int(time.time()) > int(exp):
         raise ValueError("JWT expired")
-
     return payload
 
 
 # -------------------------
-# CryptoCloud helpers
+# CryptoCloud
 # -------------------------
 def cryptocloud_headers() -> Dict[str, str]:
-    # Many providers use either "Authorization: Token xxx" or "Authorization: Bearer xxx".
-    # CryptoCloud often accepts API key header. We do both safely.
     return {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {CRYPTOCLOUD_API_KEY}",
@@ -333,20 +303,26 @@ def cryptocloud_headers() -> Dict[str, str]:
     }
 
 
+def require_cryptocloud_env() -> Optional[str]:
+    missing = []
+    if not BASE_URL:
+        missing.append("BASE_URL")
+    if not CRYPTOCLOUD_API_KEY:
+        missing.append("CRYPTOCLOUD_API_KEY")
+    if not CRYPTOCLOUD_SHOP_ID:
+        missing.append("CRYPTOCLOUD_SHOP_ID")
+    if not CRYPTOCLOUD_SECRET_KEY:
+        missing.append("CRYPTOCLOUD_SECRET_KEY")
+    if missing:
+        return " / ".join(missing)
+    return None
+
+
 def create_invoice(order_id: str, amount_usd: int) -> Tuple[str, str]:
-    """
-    Create invoice in CryptoCloud.
-    Returns: (invoice_uuid, pay_url)
+    missing = require_cryptocloud_env()
+    if missing:
+        raise RuntimeError(f"CryptoCloud env vars missing: {missing}")
 
-    NOTE:
-    Different CryptoCloud deployments may have slightly different endpoints.
-    This function tries two common ones.
-    """
-    if not (CRYPTOCLOUD_API_KEY and CRYPTOCLOUD_SHOP_ID and CRYPTOCLOUD_SECRET_KEY and BASE_URL):
-        raise RuntimeError("CryptoCloud env vars missing")
-
-    success_url = BASE_URL
-    fail_url = BASE_URL
     notify_url = f"{BASE_URL}/payments/cryptocloud/postback"
 
     payload = {
@@ -354,13 +330,11 @@ def create_invoice(order_id: str, amount_usd: int) -> Tuple[str, str]:
         "amount": float(amount_usd),
         "currency": "USD",
         "order_id": order_id,
-        "success_url": success_url,
-        "fail_url": fail_url,
+        "success_url": BASE_URL,
+        "fail_url": BASE_URL,
         "notify_url": notify_url,
-        # Some APIs accept "ttl" or "lifetime" etc; harmless if ignored by server that tolerates extras.
     }
 
-    # Try endpoints (most common patterns)
     endpoints = [
         f"{CRYPTOCLOUD_API_BASE}/api/v2/invoice/create",
         f"{CRYPTOCLOUD_API_BASE}/api/v1/invoice/create",
@@ -370,14 +344,11 @@ def create_invoice(order_id: str, amount_usd: int) -> Tuple[str, str]:
     for url in endpoints:
         try:
             r = requests.post(url, headers=cryptocloud_headers(), json=payload, timeout=30)
-            data = r.json() if r.headers.get("content-type", "").startswith("application/json") else {"raw": r.text}
-            if r.status_code >= 400 or not data:
+            data = r.json() if "application/json" in r.headers.get("content-type", "") else {"raw": r.text}
+            if r.status_code >= 400:
                 last_err = f"{url} -> HTTP {r.status_code}: {data}"
                 continue
 
-            # Common response shapes
-            # - data["result"]["uuid"] + data["result"]["link"]
-            # - data["uuid"] + data["link"]
             invoice_uuid = (
                 (data.get("result") or {}).get("uuid")
                 or data.get("uuid")
@@ -412,11 +383,9 @@ def credit_user_minutes(db, telegram_id: int, package_code: str) -> int:
 
 
 # -------------------------
-# Voice flow (Whisper + translate + TTS)
+# OpenAI: voice pipeline
 # -------------------------
 def openai_transcribe(audio_bytes: bytes, filename: str) -> str:
-    # stable choice:
-    # whisper-1 is widely supported
     tr = client.audio.transcriptions.create(
         model="whisper-1",
         file=(filename, audio_bytes),
@@ -425,29 +394,23 @@ def openai_transcribe(audio_bytes: bytes, filename: str) -> str:
 
 
 def openai_translate_text(text_: str, target_lang: str) -> str:
-    # translate via chat model (simple + robust)
     prompt = (
         "You are a professional translator.\n"
         f"Translate the text into the target language: {target_lang}.\n"
-        "Return ONLY the translated text, no explanations.\n\n"
+        "Return ONLY the translated text.\n\n"
         f"TEXT:\n{text_}\n"
     )
-    resp = client.responses.create(
-        model="gpt-4o-mini",
-        input=prompt,
-    )
-    # Responses API: get output text
+    resp = client.responses.create(model="gpt-4o-mini", input=prompt)
     out = []
     for item in resp.output or []:
         if item.type == "message":
             for c in item.content or []:
                 if c.type == "output_text":
                     out.append(c.text)
-    return "\n".join(out).strip() or ""
+    return "\n".join(out).strip()
 
 
 def openai_tts(text_: str) -> Optional[bytes]:
-    # If TTS model name differs on your account, we gracefully fallback (return None)
     try:
         audio = client.audio.speech.create(
             model="gpt-4o-mini-tts",
@@ -459,7 +422,7 @@ def openai_tts(text_: str) -> Optional[bytes]:
         return None
 
 
-def telegram_send_voice(chat_id: int, audio_bytes: bytes, filename: str = "speech.mp3") -> None:
+def telegram_send_voice(chat_id: int, audio_bytes: bytes, filename: str = "translation.mp3") -> None:
     url = f"{TG_API}/sendVoice"
     files = {"voice": (filename, audio_bytes)}
     data = {"chat_id": str(chat_id)}
@@ -477,10 +440,10 @@ def root():
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request):
     update = await request.json()
-    # Always 200 for Telegram (we handle errors internally)
+
     try:
         with SessionLocal() as db:
-            # --- message ---
+            # MESSAGE
             if "message" in update:
                 msg = update["message"]
                 chat_id = msg["chat"]["id"]
@@ -488,17 +451,14 @@ async def telegram_webhook(request: Request):
 
                 text_msg = (msg.get("text") or "").strip()
 
-                # /start
                 if text_msg == "/start":
                     show_home(chat_id, user)
                     return {"ok": True}
 
-                # /buy
                 if text_msg == "/buy":
                     send_message(chat_id, "💳 Выберите пакет минут:", reply_markup=build_buy_keyboard())
                     return {"ok": True}
 
-                # /stats (admin)
                 if text_msg == "/stats":
                     if ADMIN_ID and str(chat_id) != str(ADMIN_ID):
                         send_message(chat_id, "⛔️ Доступ запрещён.")
@@ -509,25 +469,20 @@ async def telegram_webhook(request: Request):
                     created_count = db.execute(text("SELECT COUNT(*) FROM payments WHERE status='created'")).scalar() or 0
                     send_message(
                         chat_id,
-                        f"📊 Stats\n\n"
-                        f"Users: {users_count}\n"
-                        f"Payments paid: {paid_count}\n"
-                        f"Payments created: {created_count}\n",
+                        f"📊 Stats\n\nUsers: {users_count}\nPayments paid: {paid_count}\nPayments created: {created_count}\n",
                     )
                     return {"ok": True}
 
-                # voice message handling
                 if "voice" in msg:
                     voice = msg["voice"]
                     duration = int(voice.get("duration") or 0)
                     file_id = voice["file_id"]
 
-                    # Check balance / trial
                     user = get_or_create_user(db, chat_id)
                     has_paid_balance = int(user.balance_seconds or 0) > 0
 
+                    # balance/trial rules
                     if has_paid_balance:
-                        # deduct duration (minimum 1 sec if 0)
                         deduct = max(1, duration)
                         if user.balance_seconds < deduct:
                             send_message(
@@ -539,7 +494,6 @@ async def telegram_webhook(request: Request):
                         user.balance_seconds -= deduct
                         db.commit()
                     else:
-                        # trial path
                         if user.trial_left <= 0:
                             send_message(
                                 chat_id,
@@ -557,11 +511,9 @@ async def telegram_webhook(request: Request):
                             return {"ok": True}
 
                         user.trial_left -= 1
-                        # keep legacy column in sync just in case
                         user.trial_messages = user.trial_left
                         db.commit()
 
-                    # Process audio
                     send_message(chat_id, "⏳ Слушаю и перевожу...")
                     audio_bytes, filename = telegram_get_file_bytes(file_id)
 
@@ -573,87 +525,75 @@ async def telegram_webhook(request: Request):
 
                     translated = openai_translate_text(src_text, user.target_lang)
                     if not translated.strip():
-                        send_message(chat_id, "Не удалось перевести текст. Попробуй ещё раз.")
+                        send_message(chat_id, "Не удалось перевести. Попробуй ещё раз.")
                         show_home(chat_id, user)
                         return {"ok": True}
 
                     tts_bytes = openai_tts(translated)
                     if tts_bytes:
-                        telegram_send_voice(chat_id, tts_bytes, "translation.mp3")
+                        telegram_send_voice(chat_id, tts_bytes)
                     else:
-                        # fallback to text if TTS unavailable
                         send_message(chat_id, translated)
 
-                    # show home again
                     user = get_or_create_user(db, chat_id)
                     show_home(chat_id, user)
                     return {"ok": True}
 
-                # Unknown text -> show home
+                # default
                 show_home(chat_id, user)
                 return {"ok": True}
 
-            # --- callback_query ---
+            # CALLBACKS
             if "callback_query" in update:
                 cq = update["callback_query"]
                 cb_id = cq["id"]
                 cb_data = cq.get("data") or ""
                 chat_id = cq["message"]["chat"]["id"]
-
                 user = get_or_create_user(db, chat_id)
 
-                # language change
                 if cb_data.startswith("lang_"):
                     code = cb_data.replace("lang_", "").strip()
-                    # allow only our list
                     allowed = {c for _, c in LANGS}
                     if code in allowed:
                         user.target_lang = code
                         db.commit()
                     answer_callback(cb_id)
-                    # IMPORTANT: restore your interface immediately
-                    show_home(chat_id, user)
+                    show_home(chat_id, user)  # возвращаем интерфейс
                     return {"ok": True}
 
-                # open buy
                 if cb_data == "open_buy":
                     answer_callback(cb_id)
                     send_message(chat_id, "💳 Выберите пакет минут:", reply_markup=build_buy_keyboard())
                     return {"ok": True}
 
-                # back to home
                 if cb_data == "back_home":
                     answer_callback(cb_id)
                     show_home(chat_id, user)
                     return {"ok": True}
 
-                # package buy
                 if cb_data.startswith("buy_"):
                     package_code = cb_data.replace("buy_", "").strip()
                     if package_code not in PACKAGES:
                         answer_callback(cb_id, "Неизвестный пакет", show_alert=True)
                         return {"ok": True}
 
-                    # Create payment record + invoice
+                    # ВАЖНО: invoice_id NOT NULL -> создаём инвойс ДО записи в БД
                     order_id = f"{chat_id}_{package_code}_{int(time.time())}"
                     amount_usd = int(PACKAGES[package_code]["usd"])
 
-                    # Create DB payment row first (status=created)
-                    p = Payment(
-                        telegram_id=chat_id,
-                        order_id=order_id,
-                        invoice_id=None,
-                        package_code=package_code,
-                        amount_usd=amount_usd,
-                        status="created",
-                    )
-                    db.add(p)
-                    db.commit()
-
                     try:
                         invoice_uuid, pay_url = create_invoice(order_id, amount_usd)
-                        # Store invoice id/uuid
-                        p.invoice_id = invoice_uuid
+
+                        # Теперь пишем в БД уже с invoice_id
+                        p = Payment(
+                            telegram_id=chat_id,
+                            order_id=order_id,
+                            invoice_id=invoice_uuid,
+                            package_code=package_code,
+                            amount_usd=amount_usd,
+                            status="created",
+                        )
+                        db.add(p)
                         db.commit()
 
                         answer_callback(cb_id)
@@ -661,23 +601,19 @@ async def telegram_webhook(request: Request):
                             chat_id,
                             f"✅ Счёт создан.\n\nПакет: {package_code}\nСумма: ${amount_usd}\n\n"
                             f"Оплата по ссылке:\n{pay_url}\n\n"
-                            f"После оплаты минуты начислятся автоматически.",
+                            "После оплаты минуты начислятся автоматически.",
                         )
                         return {"ok": True}
 
                     except Exception as e:
-                        p.status = "failed"
-                        db.commit()
                         answer_callback(cb_id)
                         send_message(chat_id, f"Ошибка создания счёта: {e}")
                         return {"ok": True}
 
-                # unknown callback
                 answer_callback(cb_id)
                 return {"ok": True}
 
     except Exception as e:
-        # Log to Render
         print("Webhook error:", repr(e))
 
     return {"ok": True}
@@ -685,28 +621,17 @@ async def telegram_webhook(request: Request):
 
 @app.post("/payments/cryptocloud/postback")
 async def cryptocloud_postback(request: Request):
-    """
-    CryptoCloud sends payment notifications here.
-    We:
-      - validate JWT token (HS256) if present
-      - match payment by order_id (best) or invoice id
-      - mark paid once
-      - credit minutes
-      - notify user
-    """
     raw = await request.body()
     print("==== RAW POSTBACK ====")
     print(raw.decode("utf-8", errors="replace"))
 
-    # Parse JSON
     try:
         data = json.loads(raw.decode("utf-8"))
     except Exception:
         return JSONResponse({"ok": False, "error": "invalid json"}, status_code=200)
 
-    # Validate token if present
+    # verify token if present
     token = data.get("token")
-    decoded = None
     if token and CRYPTOCLOUD_SECRET_KEY:
         try:
             decoded = verify_jwt_hs256(token, CRYPTOCLOUD_SECRET_KEY)
@@ -714,54 +639,41 @@ async def cryptocloud_postback(request: Request):
             print(decoded)
         except Exception as e:
             print("Token verify failed:", repr(e))
-            # We still accept postback to avoid losing payments, but you can change to reject if you want.
 
     status = (data.get("status") or "").lower().strip()
     order_id = (data.get("order_id") or "").strip()
-    invoice_id = (data.get("invoice_id") or "").strip()
 
     invoice_info = data.get("invoice_info") or {}
     invoice_uuid = (invoice_info.get("uuid") or "").strip()
     invoice_status = (invoice_info.get("invoice_status") or "").lower().strip()
+
     paid_flag = invoice_status == "success" or status == "success"
 
     if not order_id:
-        # sometimes providers send uuid; try to reconstruct
-        # but in your logs order_id exists, so we keep strict
         print("Missing order_id in postback")
         return JSONResponse({"ok": True}, status_code=200)
 
     with SessionLocal() as db:
-        # Find payment by order_id
-        pay: Optional[Payment] = db.query(Payment).filter(Payment.order_id == order_id).first()
+        pay = db.query(Payment).filter(Payment.order_id == order_id).first()
 
-        # If not found by order_id, try invoice matching
+        # fallback (если вдруг order_id не совпал)
         if not pay and invoice_uuid:
             pay = db.query(Payment).filter(Payment.invoice_id == invoice_uuid).first()
-        if not pay and invoice_id:
-            pay = db.query(Payment).filter(Payment.invoice_id == invoice_id).first()
 
         if not pay:
-            print("Payment not found for order_id:", order_id)
+            print("Payment not found:", order_id, invoice_uuid)
             return JSONResponse({"ok": True}, status_code=200)
-
-        # Update invoice id if missing (keep most useful)
-        if not pay.invoice_id:
-            pay.invoice_id = invoice_uuid or invoice_id or pay.invoice_id
 
         if pay.status == "paid":
             print("Already paid, skip")
-            db.commit()
             return JSONResponse({"ok": True}, status_code=200)
 
         if not paid_flag:
             print("Status not paid:", status, invoice_status)
-            # keep created status, just store update timestamp
             pay.updated_at = dt.datetime.utcnow()
             db.commit()
             return JSONResponse({"ok": True}, status_code=200)
 
-        # Mark paid + credit minutes
         pay.status = "paid"
         db.commit()
 
@@ -770,24 +682,17 @@ async def cryptocloud_postback(request: Request):
             added_min = added_seconds // 60
             send_message(
                 int(pay.telegram_id),
-                f"✅ Оплата подтверждена!\nНачислено: {added_min} мин\n\n"
-                f"Пакет: {pay.package_code}\n"
-                f"Баланс обновлён.",
+                f"✅ Оплата подтверждена!\nНачислено: {added_min} мин\n\nПакет: {pay.package_code}",
             )
         except Exception as e:
             print("Credit error:", repr(e))
-            send_message(int(pay.telegram_id), f"⚠️ Оплата получена, но не удалось начислить минуты автоматически: {e}")
+            send_message(int(pay.telegram_id), f"⚠️ Оплата получена, но не удалось начислить минуты: {e}")
 
     return JSONResponse({"ok": True}, status_code=200)
 
 
-# Helpful endpoint (for manual check)
 @app.get("/debug/env")
 def debug_env():
-    """
-    Shows which env vars are present (values hidden).
-    Remove this endpoint later if you want.
-    """
     keys = [
         "DATABASE_URL",
         "OPENAI_API_KEY",
