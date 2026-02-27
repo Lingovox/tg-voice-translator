@@ -8,12 +8,11 @@ from typing import Optional, Dict, Any
 import requests
 import jwt
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from sqlalchemy import (
-    create_engine, Column, Integer, BigInteger, String, Boolean,
-    DateTime
+    create_engine, Column, Integer, BigInteger, String, Boolean, DateTime
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import IntegrityError
@@ -64,10 +63,11 @@ LANGS = [
     ("Deutsch",  "de"),
     ("Español",  "es"),
     ("ไทย",      "th"),
-    ("Tiếng Việt","vi"),
+    ("Tiếng Việt", "vi"),
     ("Français", "fr"),
     ("Türkçe",   "tr"),
 ]
+
 
 # ----------------------------
 # DB
@@ -89,7 +89,7 @@ class User(Base):
     # trial_left — сколько бесплатных сообщений осталось
     trial_left = Column(Integer, nullable=False, default=TRIAL_LIMIT)
 
-    # trial_messages — можно хранить "сколько уже использовал" (если у тебя так задумано)
+    # trial_messages — сколько использовал (опционально)
     trial_messages = Column(Integer, nullable=False, default=0)
 
     # баланс в секундах
@@ -114,7 +114,9 @@ class Payment(Base):
 
     package_code = Column(String, nullable=False)
     amount_usd = Column(Integer, nullable=False)
-    status = Column(String, nullable=False, default="created")  # created/paid/success/failed...
+
+    # created -> paid -> credited (минуты начислены)
+    status = Column(String, nullable=False, default="created")
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -145,11 +147,9 @@ def tg_send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, An
 
 
 def build_main_keyboard(selected_lang: str) -> Dict[str, Any]:
-    # 2 колонки, 4 строки, + последняя большая кнопка "Купить минуты"
     rows = []
-    # по 2 кнопки в строке
     for i in range(0, len(LANGS), 2):
-        pair = LANGS[i:i+2]
+        pair = LANGS[i:i + 2]
         row = []
         for title, code in pair:
             prefix = "✅ " if code == selected_lang else ""
@@ -157,7 +157,6 @@ def build_main_keyboard(selected_lang: str) -> Dict[str, Any]:
         rows.append(row)
 
     rows.append([{"text": "💳 Купить минуты", "callback_data": "buy:menu"}])
-
     return {"inline_keyboard": rows}
 
 
@@ -174,7 +173,7 @@ def build_packages_keyboard() -> Dict[str, Any]:
 
 
 def format_status_text(user: User) -> str:
-    bal_min = user.balance_seconds // 60
+    bal_min = int(user.balance_seconds or 0) // 60
     return (
         "🎙 Голосовой переводчик\n\n"
         f"🌍 Язык перевода: {user.target_lang}\n"
@@ -203,7 +202,7 @@ def env_missing() -> list:
 def cryptocloud_create_invoice(order_id: str, amount_usd: int, description: str) -> Dict[str, Any]:
     """
     Создает инвойс в CryptoCloud.
-    ВАЖНО: URL должен быть https://api.cryptocloud.plus/v1/invoice/create (без /api/v1)
+    URL: https://api.cryptocloud.plus/v1/invoice/create
     """
     headers = {
         "Authorization": f"Token {CRYPTOCLOUD_API_KEY}",
@@ -222,7 +221,6 @@ def cryptocloud_create_invoice(order_id: str, amount_usd: int, description: str)
 
     r = requests.post(CC_CREATE_INVOICE_URL, headers=headers, json=payload, timeout=30)
 
-    # если Cloudflare/HTML — покажем raw
     ct = (r.headers.get("content-type") or "").lower()
     if "application/json" not in ct:
         return {"ok": False, "status": r.status_code, "raw": r.text}
@@ -262,19 +260,13 @@ def root():
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
-    """
-    Обрабатывает:
-    - /start
-    - callback кнопок (языки, покупка)
-    """
     update = await req.json()
-    # log.info(f"TG update: {update}")
 
     try:
+        # ---------------- MESSAGE ----------------
         if "message" in update:
             msg = update["message"]
-            chat = msg.get("chat", {})
-            chat_id = chat.get("id")
+            chat_id = (msg.get("chat") or {}).get("id")
             text = msg.get("text", "")
 
             if not chat_id:
@@ -297,10 +289,10 @@ async def telegram_webhook(req: Request):
 
                     kb = build_main_keyboard(user.target_lang)
                     tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
+
                 return JSONResponse({"ok": True})
 
             if text == "/buy":
-                # если человек руками ввел
                 with SessionLocal() as db:
                     user = db.get(User, int(chat_id))
                     if not user:
@@ -308,24 +300,25 @@ async def telegram_webhook(req: Request):
                         db.add(user)
                         db.commit()
                         db.refresh(user)
+
                 tg_send_message(chat_id, "💳 Выбери пакет минут:", reply_markup=build_packages_keyboard())
                 return JSONResponse({"ok": True})
 
-            # (здесь можно обработать voice и перевод — оставляем твою логику отдельно)
+            # тут может быть твоя логика голоса/перевода
             return JSONResponse({"ok": True})
 
+        # ------------- CALLBACK QUERY -------------
         if "callback_query" in update:
             cq = update["callback_query"]
             data = cq.get("data", "")
-            message = cq.get("message", {})
-            chat_id = message.get("chat", {}).get("id")
+            chat_id = ((cq.get("message") or {}).get("chat") or {}).get("id")
 
             if not chat_id:
                 return JSONResponse({"ok": True})
 
             # Язык
             if data.startswith("lang:"):
-                lang = data.split(":", 1)[1]
+                lang = data.split(":", 1)[1].strip()
                 with SessionLocal() as db:
                     user = db.get(User, int(chat_id))
                     if not user:
@@ -346,12 +339,13 @@ async def telegram_webhook(req: Request):
                 tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
                 return JSONResponse({"ok": True})
 
-            # Покупка
+            # Покупка меню
             if data == "buy:menu":
                 tg_send_message(chat_id, "💳 Выбери пакет минут:", reply_markup=build_packages_keyboard())
                 tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
                 return JSONResponse({"ok": True})
 
+            # Назад
             if data == "buy:back":
                 with SessionLocal() as db:
                     user = db.get(User, int(chat_id))
@@ -365,8 +359,9 @@ async def telegram_webhook(req: Request):
                 tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
                 return JSONResponse({"ok": True})
 
+            # Покупка пакета
             if data.startswith("buy:"):
-                package_code = data.split(":", 1)[1]
+                package_code = data.split(":", 1)[1].strip().upper()
                 if package_code not in PACKAGES:
                     tg_send_message(chat_id, "Неизвестный пакет.")
                     tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
@@ -378,11 +373,10 @@ async def telegram_webhook(req: Request):
                     tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
                     return JSONResponse({"ok": True})
 
-                amount_usd = PACKAGES[package_code]["usd"]
+                amount_usd = int(PACKAGES[package_code]["usd"])
                 order_id = f"{chat_id}_{package_code}_{int(time.time())}"
                 description = f"Minutes package {package_code} for user {chat_id}"
 
-                # Create invoice in CryptoCloud
                 cc = cryptocloud_create_invoice(order_id=order_id, amount_usd=amount_usd, description=description)
                 if not cc["ok"]:
                     tg_send_message(
@@ -394,9 +388,6 @@ async def telegram_webhook(req: Request):
                     return JSONResponse({"ok": True})
 
                 data_json = cc["data"]
-
-                # В ответах встречаются разные структуры. Достаём максимально безопасно:
-                # Чаще всего: {"status":"success","result":{"uuid":"INV-XXXX","link":"https://pay..."}}
                 result = data_json.get("result") or data_json.get("data") or data_json
                 invoice_uuid = result.get("uuid") or result.get("invoice_id") or result.get("id")
                 pay_url = result.get("link") or result.get("pay_url") or result.get("url")
@@ -406,7 +397,7 @@ async def telegram_webhook(req: Request):
                     tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
                     return JSONResponse({"ok": True})
 
-                # Save payment in DB (invoice_id NOT NULL!)
+                # Save payment in DB
                 with SessionLocal() as db:
                     try:
                         p = Payment(
@@ -414,7 +405,7 @@ async def telegram_webhook(req: Request):
                             order_id=order_id,
                             invoice_id=str(invoice_uuid),
                             package_code=package_code,
-                            amount_usd=int(amount_usd),
+                            amount_usd=amount_usd,
                             status="created",
                             created_at=datetime.utcnow(),
                             updated_at=datetime.utcnow(),
@@ -424,7 +415,6 @@ async def telegram_webhook(req: Request):
                     except IntegrityError as e:
                         db.rollback()
                         log.warning(f"Payment insert IntegrityError: {e}")
-                        # если order_id или invoice_id уже есть — покажем ссылку повторно
                     except Exception as e:
                         db.rollback()
                         tg_send_message(chat_id, f"DB error: {e}")
@@ -435,20 +425,16 @@ async def telegram_webhook(req: Request):
                     kb = {
                         "inline_keyboard": [
                             [{"text": "Перейти к оплате ✅", "url": pay_url}],
-                            [{"text": "Проверить оплату 🔄", "callback_data": f"check:{invoice_uuid}"}],
                         ]
                     }
-                    tg_send_message(chat_id, f"Счёт создан. Сумма: ${amount_usd}\nПакет: {package_code}", reply_markup=kb)
+                    tg_send_message(
+                        chat_id,
+                        f"Счёт создан. Сумма: ${amount_usd}\nПакет: {package_code}",
+                        reply_markup=kb,
+                    )
                 else:
                     tg_send_message(chat_id, f"Счёт создан: {invoice_uuid}\n(В ответе не было ссылки оплаты)")
 
-                tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
-                return JSONResponse({"ok": True})
-
-            # Проверка статуса (опционально)
-            if data.startswith("check:"):
-                invoice_id = data.split(":", 1)[1]
-                tg_send_message(chat_id, f"Статус счёта: {invoice_id}\n(Проверка сейчас через postback/вручную)")
                 tg_request("answerCallbackQuery", {"callback_query_id": cq["id"]})
                 return JSONResponse({"ok": True})
 
@@ -456,21 +442,23 @@ async def telegram_webhook(req: Request):
             return JSONResponse({"ok": True})
 
         return JSONResponse({"ok": True})
-    except Exception as e:
+
+    except Exception:
         log.exception("telegram_webhook error")
-        return JSONResponse({"ok": True, "error": str(e)})
+        return JSONResponse({"ok": True})
 
 
 @app.post(POSTBACK_PATH)
 async def cryptocloud_postback(req: Request):
     """
-    Сюда CryptoCloud шлёт уведомления.
-    Мы:
-    - проверяем JWT token подписью secret_key
-    - находим payment по order_id / invoice_id
-    - если paid/success — начисляем секунды
+    Postback:
+    - проверяем JWT token
+    - находим payment
+    - если paid/success -> начисляем секунды
+    - защита: НЕ скипаем на paid, скипаем только на credited
     """
     raw = await req.body()
+
     try:
         try:
             payload = json.loads(raw.decode("utf-8"))
@@ -480,7 +468,7 @@ async def cryptocloud_postback(req: Request):
         log.info("==== RAW POSTBACK ====")
         log.info(payload)
 
-        status = (payload.get("status") or "").lower()
+        status = (payload.get("status") or "").lower().strip()
         order_id = payload.get("order_id")
         token = payload.get("token")
 
@@ -491,91 +479,98 @@ async def cryptocloud_postback(req: Request):
         if not decoded:
             return PlainTextResponse("bad token", status_code=400)
 
-        # invoice id from token
         token_invoice_id = decoded.get("id")
 
-        # В postback бывает:
-        # invoice_id: "BOVIBV5N"
-        # invoice_info.uuid: "INV-BOVIBV5N"
         postback_invoice_id = payload.get("invoice_id")
         invoice_info = payload.get("invoice_info") or {}
         invoice_uuid = invoice_info.get("uuid")
 
-        # Выберем "главный" invoice_id который точно не пустой:
         effective_invoice_id = invoice_uuid or postback_invoice_id or token_invoice_id
         if not effective_invoice_id and not order_id:
             return PlainTextResponse("no invoice_id/order_id", status_code=400)
 
-        # Статусы "успеха"
+        # statuses that mean "paid"
         is_paid = status in ("success", "paid")
-        invoice_status = (invoice_info.get("invoice_status") or "").lower()
+        invoice_status = (invoice_info.get("invoice_status") or "").lower().strip()
         if invoice_status in ("success", "paid"):
             is_paid = True
 
         with SessionLocal() as db:
-            q = None
+            pay = None
             if order_id:
-                q = db.query(Payment).filter(Payment.order_id == order_id).first()
-            if not q and effective_invoice_id:
-                q = db.query(Payment).filter(Payment.invoice_id == str(effective_invoice_id)).first()
+                pay = db.query(Payment).filter(Payment.order_id == order_id).first()
+            if not pay and effective_invoice_id:
+                pay = db.query(Payment).filter(Payment.invoice_id == str(effective_invoice_id)).first()
 
-            if not q:
+            if not pay:
                 log.warning(f"Payment not found for order_id={order_id} invoice_id={effective_invoice_id}")
                 return PlainTextResponse("payment not found", status_code=200)
 
-            # если уже успех — не начисляем повторно
-            if (q.status or "").lower() in ("paid", "success"):
-                log.info("Already paid, skip")
+            current_status = (pay.status or "").lower().strip()
+
+            # ВАЖНО: скипаем только если уже начислили
+            if current_status == "credited":
+                log.info("Already credited, skip")
                 return PlainTextResponse("ok", status_code=200)
 
+            # если не paid — просто обновим статус
             if not is_paid:
-                # просто обновим статус
-                q.status = status or "unknown"
-                q.updated_at = datetime.utcnow()
-                db.add(q)
+                pay.status = status or "unknown"
+                pay.updated_at = datetime.utcnow()
+                db.add(pay)
                 db.commit()
-                log.info(f"Status not paid: {q.status}")
+                log.info(f"Status not paid: {pay.status}")
                 return PlainTextResponse("ok", status_code=200)
 
-            # PAID => начисляем минуты
-            pkg = PACKAGES.get(q.package_code)
+            # paid -> начисляем
+            pkg_code = (pay.package_code or "").strip().upper()
+            pkg = PACKAGES.get(pkg_code)
+
+            # отметим хотя бы paid (чтобы было видно что оплата подтверждена)
+            pay.status = "paid"
+            pay.updated_at = datetime.utcnow()
+            db.add(pay)
+            db.commit()
+
             if not pkg:
-                q.status = "paid"
-                q.updated_at = datetime.utcnow()
-                db.add(q)
-                db.commit()
+                log.warning(f"Unknown package_code in DB: {pay.package_code}")
                 return PlainTextResponse("ok", status_code=200)
 
             add_seconds = int(pkg["minutes"] * 60)
 
-            user = db.get(User, int(q.telegram_id))
+            user = db.get(User, int(pay.telegram_id))
             if not user:
-                user = User(telegram_id=int(q.telegram_id), target_lang="en", trial_left=TRIAL_LIMIT)
+                user = User(telegram_id=int(pay.telegram_id), target_lang="en", trial_left=TRIAL_LIMIT)
                 db.add(user)
                 db.commit()
                 db.refresh(user)
 
-            user.balance_seconds = int(user.balance_seconds or 0) + add_seconds
+            before = int(user.balance_seconds or 0)
+            user.balance_seconds = before + add_seconds
             user.updated_at = datetime.utcnow()
 
-            q.status = "paid"
-            q.updated_at = datetime.utcnow()
+            # ключевая строка: ставим credited ТОЛЬКО после начисления
+            pay.status = "credited"
+            pay.updated_at = datetime.utcnow()
 
             db.add(user)
-            db.add(q)
+            db.add(pay)
             db.commit()
             db.refresh(user)
 
-            # уведомим пользователя
-            bal_min = user.balance_seconds // 60
+            after = int(user.balance_seconds or 0)
+            log.info(f"CREDITED: tg_id={user.telegram_id} package={pkg_code} +{add_seconds}s "
+                     f"({before}s -> {after}s) payment_order={pay.order_id}")
+
+            bal_min = after // 60
             tg_send_message(
                 int(user.telegram_id),
-                f"✅ Оплата получена!\nПакет: {q.package_code}\nНачислено: {pkg['minutes']} мин\nБаланс: {bal_min} мин",
+                f"✅ Оплата получена!\nПакет: {pkg_code}\nНачислено: {pkg['minutes']} мин\nБаланс: {bal_min} мин",
                 reply_markup=build_main_keyboard(user.target_lang),
             )
 
         return PlainTextResponse("ok", status_code=200)
 
-    except Exception as e:
+    except Exception:
         log.exception("postback error")
-        return PlainTextResponse(f"error: {e}", status_code=200)
+        return PlainTextResponse("error", status_code=200)
