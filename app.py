@@ -195,64 +195,75 @@ def create_invoice(package_code: str, telegram_id: int):
 async def cryptocloud_postback(request: Request):
     raw = await request.body()
     print("==== RAW POSTBACK ====")
-    print(raw)
+    print(raw.decode("utf-8", "ignore")[:4000])
 
     payload = await request.json()
 
-    token = payload.get("token")
-    if not token:
-        return {"error": "No token"}
+    # Берём статус и order_id из payload / invoice_info
+    invoice_info = payload.get("invoice_info") or {}
+    order_id = payload.get("order_id") or invoice_info.get("order_id")
+    invoice_id = (invoice_info.get("uuid") or payload.get("invoice_id") or payload.get("uuid") or "")
 
-    try:
-        data = verify_token(token)
-    except Exception as e:
-        print("JWT ERROR:", e)
-        return {"error": "Invalid token"}
-
-    print("==== DECODED DATA ====")
-    print(data)
-
+    # Статусы: payload.status = success, invoice_info.status = paid
     status = (
-        data.get("status")
-        or data.get("invoice_status")
+        invoice_info.get("status")
+        or invoice_info.get("invoice_status")
+        or payload.get("status")
+        or payload.get("invoice_status")
     )
 
-    order_id = (
-        data.get("order_id")
-        or (data.get("invoice") or {}).get("order_id")
-    )
+    def is_paid(s: str) -> bool:
+        if not s:
+            return False
+        s = s.lower()
+        return s in {"paid", "success", "completed"} or ("paid" in s) or ("success" in s)
 
-    invoice_id = data.get("uuid") or data.get("invoice_id")
+    if not order_id:
+        print("No order_id -> ignored")
+        return {"ok": True}
 
-    if not _is_paid_status(status):
+    if not is_paid(status):
         print("Status not paid:", status)
         return {"ok": True}
 
-    if not order_id:
-        print("No order_id")
-        return {"ok": True}
-
+    # ---- Обновляем payment и начисляем минуты ----
     db = SessionLocal()
-    payment = db.query(Payment).filter_by(order_id=order_id).first()
+    try:
+        pay = db.query(Payment).filter(Payment.order_id == order_id).first()
+        if not pay:
+            print("Payment not found for order_id:", order_id)
+            return {"ok": True}
 
-    if not payment:
-        print("Payment not found")
-        return {"ok": True}
+        # идемпотентность: не начисляем повторно
+        if (pay.status or "").lower() == "paid":
+            print("Already paid, skip")
+            return {"ok": True}
 
-    if payment.status == "paid":
-        return {"ok": True}
+        pay.status = "paid"
+        if invoice_id:
+            pay.invoice_id = str(invoice_id)
 
-    package_code = payment.package_code.upper()
-    minutes = PACKAGES[package_code]["minutes"]
+        package_code = (pay.package_code or "").upper()
+        minutes = PACKAGES.get(package_code, {}).get("minutes")
+        if not minutes:
+            print("Unknown package:", package_code)
+            db.commit()
+            return {"ok": True}
 
-    user = db.query(User).filter_by(telegram_id=payment.telegram_id).first()
-    user.balance_seconds += minutes * 60
+        user = db.query(User).filter(User.telegram_id == pay.telegram_id).first()
+        if not user:
+            user = User(telegram_id=pay.telegram_id)
+            db.add(user)
+            db.flush()
 
-    payment.status = "paid"
-    payment.invoice_id = invoice_id or payment.invoice_id
+        user.balance_seconds = (user.balance_seconds or 0) + minutes * 60
 
-    db.commit()
+        db.commit()
 
-    send_message(user.telegram_id, f"✅ Оплата подтверждена.\nНачислено {minutes} минут.")
+        send_message(user.telegram_id, f"✅ Оплата подтверждена.\nНачислено: +{minutes} мин.\nБаланс: {user.balance_seconds//60} мин.")
+        print("✅ Credited minutes:", minutes, "to", user.telegram_id)
+
+    finally:
+        db.close()
 
     return {"ok": True}
