@@ -44,7 +44,7 @@ ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-# Models (можно переопределить в env)
+# Models (can be overridden in env)
 OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1").strip()
 OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini").strip()
 OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "tts-1").strip()
@@ -57,6 +57,7 @@ CRYPTOCLOUD_SECRET_KEY = os.getenv("CRYPTOCLOUD_SECRET_KEY", "").strip()
 TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "5"))
 TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "60"))
 MIN_BILLABLE_SECONDS = int(os.getenv("MIN_BILLABLE_SECONDS", "1"))
+
 
 # ============================================================
 # CONSTANTS
@@ -74,7 +75,6 @@ CC_CREATE_INVOICE_URL = "https://api.cryptocloud.plus/v1/invoice/create"
 
 OPENAI_BASE = "https://api.openai.com/v1"
 
-
 PACKAGES = {
     "P30":  {"usd": 3,  "minutes": 30},
     "P60":  {"usd": 8,  "minutes": 60},
@@ -84,15 +84,15 @@ PACKAGES = {
 
 LANGS = [
     ("English",    "en"),
-    ("Русский",    "ru"),
-    ("Deutsch",    "de"),
-    ("Español",    "es"),
-    ("ไทย",        "th"),
-    ("Tiếng Việt", "vi"),
-    ("Français",   "fr"),
-    ("Türkçe",     "tr"),
-    ("中文",        "zh"),
-    ("العربية",    "ar"),
+    ("Russian",    "ru"),
+    ("German",     "de"),
+    ("Spanish",    "es"),
+    ("Thai",       "th"),
+    ("Vietnamese", "vi"),
+    ("French",     "fr"),
+    ("Turkish",    "tr"),
+    ("Chinese",    "zh"),
+    ("Arabic",     "ar"),
 ]
 
 
@@ -209,19 +209,19 @@ def build_main_keyboard(selected_lang: str) -> Dict[str, Any]:
             row.append({"text": f"{prefix}{title}", "callback_data": f"lang:{code}"})
         rows.append(row)
 
-    rows.append([{"text": "💳 Купить минуты", "callback_data": "buy:menu"}])
-    rows.append([{"text": "📌 Баланс", "callback_data": "me:balance"}])
+    rows.append([{"text": "💳 Buy minutes", "callback_data": "buy:menu"}])
+    rows.append([{"text": "📌 Balance", "callback_data": "me:balance"}])
     return {"inline_keyboard": rows}
 
 
 def build_packages_keyboard() -> Dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "30 мин — $3", "callback_data": "buy:P30"}],
-            [{"text": "60 мин — $8", "callback_data": "buy:P60"}],
-            [{"text": "180 мин — $20", "callback_data": "buy:P180"}],
-            [{"text": "600 мин — $50", "callback_data": "buy:P600"}],
-            [{"text": "⬅️ Назад", "callback_data": "buy:back"}],
+            [{"text": "30 min — $3", "callback_data": "buy:P30"}],
+            [{"text": "60 min — $8", "callback_data": "buy:P60"}],
+            [{"text": "180 min — $20", "callback_data": "buy:P180"}],
+            [{"text": "600 min — $50", "callback_data": "buy:P600"}],
+            [{"text": "⬅️ Back", "callback_data": "buy:back"}],
         ]
     }
 
@@ -229,11 +229,11 @@ def build_packages_keyboard() -> Dict[str, Any]:
 def format_status_text(user: User) -> str:
     bal_min = max(0, int(user.balance_seconds or 0)) // 60
     return (
-        "🎙 Голосовой переводчик\n\n"
-        f"🌍 Язык перевода: {user.target_lang}\n"
-        f"🎁 Бесплатных переводов: {int(user.trial_left or 0)} (≤ {TRIAL_MAX_SECONDS} сек)\n"
-        f"💳 Баланс: {bal_min} мин\n\n"
-        "Запиши голосовое — я переведу и пришлю озвучку."
+        "🎙 Voice Translator\n\n"
+        f"🌍 Target language: {user.target_lang}\n"
+        f"🎁 Free trials left: {int(user.trial_left or 0)} (≤ {TRIAL_MAX_SECONDS} sec)\n"
+        f"💳 Balance: {bal_min} min\n\n"
+        "Send a voice message — I will translate it and reply with voice."
     )
 
 
@@ -300,13 +300,9 @@ def openai_headers() -> Dict[str, str]:
 
 
 def ffmpeg_ogg_to_wav(ogg_path: str, wav_path: str):
-    """
-    Требует ffmpeg в контейнере.
-    """
     cmd = ["ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path]
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        return p
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
     except FileNotFoundError:
         raise RuntimeError("ffmpeg not found in container. Install ffmpeg in Dockerfile.")
     except subprocess.CalledProcessError as e:
@@ -314,9 +310,6 @@ def ffmpeg_ogg_to_wav(ogg_path: str, wav_path: str):
 
 
 def openai_transcribe_wav(wav_path: str) -> str:
-    """
-    Whisper STT: /v1/audio/transcriptions
-    """
     url = f"{OPENAI_BASE}/audio/transcriptions"
     headers = openai_headers()
     data = {"model": OPENAI_STT_MODEL}
@@ -326,14 +319,10 @@ def openai_transcribe_wav(wav_path: str) -> str:
     if r.status_code != 200:
         raise RuntimeError(f"STT failed HTTP {r.status_code}: {r.text}")
     j = r.json()
-    text = j.get("text") or ""
-    return text.strip()
+    return (j.get("text") or "").strip()
 
 
 def openai_translate_text(text: str, target_lang: str) -> str:
-    """
-    Перевод через chat completions.
-    """
     url = f"{OPENAI_BASE}/chat/completions"
     headers = openai_headers()
     headers["Content-Type"] = "application/json"
@@ -364,10 +353,6 @@ def openai_translate_text(text: str, target_lang: str) -> str:
 
 
 def openai_tts_to_ogg(text: str) -> bytes:
-    """
-    TTS: /v1/audio/speech
-    output=opus (Telegram-friendly)
-    """
     url = f"{OPENAI_BASE}/audio/speech"
     headers = openai_headers()
     headers["Content-Type"] = "application/json"
@@ -376,7 +361,7 @@ def openai_tts_to_ogg(text: str) -> bytes:
         "model": OPENAI_TTS_MODEL,
         "voice": OPENAI_TTS_VOICE,
         "input": text,
-        "format": "opus",  # отдаёт opus контейнер (обычно подходит Telegram)
+        "format": "opus",
     }
 
     r = requests.post(url, headers=headers, json=payload, timeout=120)
@@ -430,7 +415,7 @@ def check_can_process_voice(user: User, duration: int) -> Tuple[bool, str, Dict[
     duration = int(duration or 0)
     bill = seconds_to_bill(duration)
     if bill <= 0:
-        return False, "Не вижу длительность аудио. Попробуй ещё раз.", {}
+        return False, "I can't detect the audio duration. Please try again.", {}
 
     if can_use_trial(user, duration):
         return True, "", {"mode": "trial", "billed_seconds": bill}
@@ -438,7 +423,7 @@ def check_can_process_voice(user: User, duration: int) -> Tuple[bool, str, Dict[
     bal = int(user.balance_seconds or 0)
     if bal < bill:
         need_min = (bill - bal + 59) // 60
-        return False, f"❌ Недостаточно минут. Нужно ещё примерно {need_min} мин.\nНажми «💳 Купить минуты».", {}
+        return False, f"❌ Not enough minutes. You need about {need_min} more min.\nTap “💳 Buy minutes”.", {}
 
     return True, "", {"mode": "paid", "billed_seconds": bill}
 
@@ -500,9 +485,6 @@ def build_stats_text(db) -> str:
 # REAL VOICE PIPELINE
 # ============================================================
 def process_voice_real(file_id: str, target_lang: str) -> Tuple[str, bytes]:
-    """
-    Returns: (translated_text, tts_ogg_bytes)
-    """
     file_path = tg_get_file_path(file_id)
     ogg_bytes = tg_download_file(file_path)
 
@@ -513,18 +495,13 @@ def process_voice_real(file_id: str, target_lang: str) -> Tuple[str, bytes]:
         with open(ogg_path, "wb") as f:
             f.write(ogg_bytes)
 
-        # Convert to WAV
         ffmpeg_ogg_to_wav(ogg_path, wav_path)
 
-        # STT
         transcript = openai_transcribe_wav(wav_path)
         if not transcript:
             raise RuntimeError("Empty transcript")
 
-        # Translate
         translated = openai_translate_text(transcript, target_lang)
-
-        # TTS (opus/ogg)
         tts_bytes = openai_tts_to_ogg(translated)
 
         return translated, tts_bytes
@@ -572,16 +549,17 @@ async def telegram_webhook(req: Request):
                     return JSONResponse({"ok": True})
 
                 if text_ == "/buy":
-                    tg_send_message(chat_id, "💳 Выбери пакет минут:", reply_markup=build_packages_keyboard())
+                    tg_send_message(chat_id, "💳 Choose a minutes package:", reply_markup=build_packages_keyboard())
                     return JSONResponse({"ok": True})
 
                 if text_ == "/me":
                     send_menu(chat_id, user)
                     return JSONResponse({"ok": True})
 
-                if text_ == "/stats":
+                # Admin stats: support /stats and /stat
+                if text_ in ("/stats", "/stat"):
                     if not is_admin(chat_id):
-                        tg_send_message(chat_id, "⛔️ Доступ запрещён.")
+                        tg_send_message(chat_id, "⛔️ Access denied.")
                         return JSONResponse({"ok": True})
                     tg_send_message(chat_id, build_stats_text(db))
                     return JSONResponse({"ok": True})
@@ -593,7 +571,7 @@ async def telegram_webhook(req: Request):
                     file_id = voice.get("file_id")
 
                     if not file_id:
-                        send_menu(chat_id, user, extra_text="Не могу получить file_id. Попробуй ещё раз.")
+                        send_menu(chat_id, user, extra_text="I can't get the file_id. Please try again.")
                         return JSONResponse({"ok": True})
 
                     ok, err_text, ctx = check_can_process_voice(user, duration)
@@ -601,33 +579,29 @@ async def telegram_webhook(req: Request):
                         send_menu(chat_id, user, extra_text=err_text)
                         return JSONResponse({"ok": True})
 
-                    # обработка: download -> ffmpeg -> stt -> translate -> tts
                     try:
                         translated_text, tts_ogg = process_voice_real(file_id, user.target_lang)
                     except Exception as e:
                         log.exception(f"voice processing failed: {e}")
                         hint = ""
                         if "ffmpeg not found" in str(e).lower():
-                            hint = "\n\n⚠️ В контейнере нет ffmpeg. Его нужно поставить в Dockerfile."
-                        send_menu(chat_id, user, extra_text=f"❌ Ошибка обработки: {e}{hint}")
+                            hint = "\n\n⚠️ ffmpeg is missing in the container. Install it in Dockerfile."
+                        send_menu(chat_id, user, extra_text=f"❌ Processing error: {e}{hint}")
                         return JSONResponse({"ok": True})
 
-                    # списание после успеха
                     commit_debit_after_success(db, user, duration, ctx)
                     db.refresh(user)
 
-                    # отправляем озвучку
                     tg_send_voice(
                         chat_id,
                         tts_ogg,
-                        caption=f"✅ Перевод: {translated_text[:900]}",
+                        caption=f"✅ Translation: {translated_text[:900]}",
                     )
 
-                    # возвращаем меню
                     send_menu(chat_id, user)
                     return JSONResponse({"ok": True})
 
-                # default: не даём меню пропасть
+                # default: keep menu visible
                 send_menu(chat_id, user)
                 return JSONResponse({"ok": True})
 
@@ -647,7 +621,6 @@ async def telegram_webhook(req: Request):
             with SessionLocal() as db:
                 user = get_or_create_user(db, int(chat_id))
 
-                # Language
                 if data.startswith("lang:"):
                     lang = data.split(":", 1)[1].strip()
                     allowed = {c for _, c in LANGS}
@@ -665,7 +638,7 @@ async def telegram_webhook(req: Request):
                     return JSONResponse({"ok": True})
 
                 if data == "buy:menu":
-                    tg_send_message(chat_id, "💳 Выбери пакет минут:", reply_markup=build_packages_keyboard())
+                    tg_send_message(chat_id, "💳 Choose a minutes package:", reply_markup=build_packages_keyboard())
                     return JSONResponse({"ok": True})
 
                 if data == "buy:back":
@@ -675,12 +648,12 @@ async def telegram_webhook(req: Request):
                 if data.startswith("buy:"):
                     package_code = data.split(":", 1)[1].strip().upper()
                     if package_code not in PACKAGES:
-                        send_menu(chat_id, user, extra_text="Неизвестный пакет.")
+                        send_menu(chat_id, user, extra_text="Unknown package.")
                         return JSONResponse({"ok": True})
 
                     missing = env_missing_for_payments()
                     if missing:
-                        send_menu(chat_id, user, extra_text=f"Ошибка: env vars missing: {', '.join(missing)}")
+                        send_menu(chat_id, user, extra_text=f"Error: missing env vars: {', '.join(missing)}")
                         return JSONResponse({"ok": True})
 
                     amount_usd = int(PACKAGES[package_code]["usd"])
@@ -693,7 +666,7 @@ async def telegram_webhook(req: Request):
                             chat_id,
                             user,
                             extra_text=(
-                                f"Ошибка создания счёта: {CC_CREATE_INVOICE_URL} -> HTTP {cc.get('status')}\n"
+                                f"Invoice creation failed: {CC_CREATE_INVOICE_URL} -> HTTP {cc.get('status')}\n"
                                 f"{cc.get('raw') or cc.get('data')}"
                             ),
                         )
@@ -705,7 +678,7 @@ async def telegram_webhook(req: Request):
                     pay_url = result.get("link") or result.get("pay_url") or result.get("url")
 
                     if not invoice_uuid:
-                        send_menu(chat_id, user, extra_text=f"CryptoCloud ответ без invoice uuid: {data_json}")
+                        send_menu(chat_id, user, extra_text=f"CryptoCloud response has no invoice uuid: {data_json}")
                         return JSONResponse({"ok": True})
 
                     try:
@@ -726,18 +699,17 @@ async def telegram_webhook(req: Request):
                         log.warning(f"Payment insert IntegrityError: {e}")
 
                     if pay_url:
-                        kb = {"inline_keyboard": [[{"text": "Перейти к оплате ✅", "url": pay_url}]]}
+                        kb = {"inline_keyboard": [[{"text": "Go to payment ✅", "url": pay_url}]]}
                         tg_send_message(
                             chat_id,
-                            f"Счёт создан.\nПакет: {package_code}\nСумма: ${amount_usd}\n\nНажми кнопку ниже:",
+                            f"Invoice created.\nPackage: {package_code}\nAmount: ${amount_usd}\n\nTap the button below:",
                             reply_markup=kb,
                         )
                     else:
-                        tg_send_message(chat_id, f"Счёт создан: {invoice_uuid}\n(В ответе не было ссылки оплаты)")
+                        tg_send_message(chat_id, f"Invoice created: {invoice_uuid}\n(No payment link in response)")
 
                     return JSONResponse({"ok": True})
 
-                # fallback
                 send_menu(chat_id, user)
                 return JSONResponse({"ok": True})
 
@@ -802,7 +774,6 @@ async def cryptocloud_postback(req: Request):
 
             current_status = (pay.status or "").lower().strip()
 
-            # идемпотентность: credited = уже начислили
             if current_status == "credited":
                 log.info("Already credited, skip")
                 return PlainTextResponse("ok", status_code=200)
@@ -864,7 +835,7 @@ async def cryptocloud_postback(req: Request):
 
             tg_send_message(
                 int(user.telegram_id),
-                f"✅ Оплата получена!\nПакет: {pkg_code}\nНачислено: {pkg['minutes']} мин\nБаланс: {after // 60} мин",
+                f"✅ Payment received!\nPackage: {pkg_code}\nCredited: {pkg['minutes']} min\nBalance: {after // 60} min",
                 reply_markup=build_main_keyboard(user.target_lang),
             )
 
