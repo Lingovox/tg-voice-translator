@@ -2,6 +2,8 @@ import os
 import time
 import json
 import logging
+import tempfile
+import subprocess
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
@@ -20,7 +22,6 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     func,
-    text,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import IntegrityError
@@ -32,6 +33,7 @@ from sqlalchemy.exc import IntegrityError
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
 
+
 # ============================================================
 # ENV
 # ============================================================
@@ -40,23 +42,39 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
 ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+# Models (можно переопределить в env)
+OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "whisper-1").strip()
+OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini").strip()
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "tts-1").strip()
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
+
 CRYPTOCLOUD_API_KEY = os.getenv("CRYPTOCLOUD_API_KEY", "").strip()
 CRYPTOCLOUD_SHOP_ID = os.getenv("CRYPTOCLOUD_SHOP_ID", "").strip()
 CRYPTOCLOUD_SECRET_KEY = os.getenv("CRYPTOCLOUD_SECRET_KEY", "").strip()
 
 TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "5"))
-TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "60"))  # max per trial voice
+TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "60"))
 MIN_BILLABLE_SECONDS = int(os.getenv("MIN_BILLABLE_SECONDS", "1"))
 
 # ============================================================
 # CONSTANTS
 # ============================================================
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is missing")
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
+
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 POSTBACK_PATH = "/payments/cryptocloud/postback"
 CC_CREATE_INVOICE_URL = "https://api.cryptocloud.plus/v1/invoice/create"
 
-# Package mapping: minutes -> price USD
+OPENAI_BASE = "https://api.openai.com/v1"
+
+
 PACKAGES = {
     "P30":  {"usd": 3,  "minutes": 30},
     "P60":  {"usd": 8,  "minutes": 60},
@@ -65,24 +83,22 @@ PACKAGES = {
 }
 
 LANGS = [
-    ("English",   "en"),
-    ("Русский",   "ru"),
-    ("Deutsch",   "de"),
-    ("Español",   "es"),
-    ("ไทย",       "th"),
-    ("Tiếng Việt","vi"),
-    ("Français",  "fr"),
-    ("Türkçe",    "tr"),
-    ("中文",       "zh"),
-    ("العربية",   "ar"),
+    ("English",    "en"),
+    ("Русский",    "ru"),
+    ("Deutsch",    "de"),
+    ("Español",    "es"),
+    ("ไทย",        "th"),
+    ("Tiếng Việt", "vi"),
+    ("Français",   "fr"),
+    ("Türkçe",     "tr"),
+    ("中文",        "zh"),
+    ("العربية",    "ar"),
 ]
+
 
 # ============================================================
 # DB
 # ============================================================
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is missing")
-
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
@@ -110,7 +126,7 @@ class Payment(Base):
     telegram_id = Column(BigInteger, nullable=False, index=True)
 
     order_id = Column(String, nullable=False, unique=True, index=True)
-    invoice_id = Column(String, nullable=False, unique=True, index=True)  # NOT NULL
+    invoice_id = Column(String, nullable=False, unique=True, index=True)
 
     package_code = Column(String, nullable=False)
     amount_usd = Column(Integer, nullable=False)
@@ -133,20 +149,54 @@ def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{TG_API}/{method}"
     r = requests.post(url, json=payload, timeout=30)
     try:
-        return r.json()
+        data = r.json()
     except Exception:
-        return {"ok": False, "raw": r.text, "status": r.status_code}
+        data = {"ok": False, "raw": r.text, "status": r.status_code}
+    if not data.get("ok", False):
+        log.warning(f"Telegram API error in {method}: {data}")
+    return data
 
 
 def tg_send_message(chat_id: int, text_: str, reply_markup: Optional[Dict[str, Any]] = None):
     payload: Dict[str, Any] = {"chat_id": chat_id, "text": text_}
-    if reply_markup:
+    if reply_markup is not None:
         payload["reply_markup"] = reply_markup
     tg_request("sendMessage", payload)
 
 
 def tg_answer_callback(callback_query_id: str):
     tg_request("answerCallbackQuery", {"callback_query_id": callback_query_id})
+
+
+def tg_get_file_path(file_id: str) -> str:
+    r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30)
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"getFile failed: {data}")
+    return data["result"]["file_path"]
+
+
+def tg_download_file(file_path: str) -> bytes:
+    url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+
+def tg_send_voice(chat_id: int, voice_bytes: bytes, caption: Optional[str] = None):
+    url = f"{TG_API}/sendVoice"
+    files = {"voice": ("speech.ogg", voice_bytes)}
+    data = {"chat_id": str(chat_id)}
+    if caption:
+        data["caption"] = caption
+    r = requests.post(url, data=data, files=files, timeout=60)
+    try:
+        j = r.json()
+    except Exception:
+        j = {"ok": False, "raw": r.text, "status": r.status_code}
+    if not j.get("ok", False):
+        log.warning(f"sendVoice error: {j}")
+    return j
 
 
 def build_main_keyboard(selected_lang: str) -> Dict[str, Any]:
@@ -158,6 +208,7 @@ def build_main_keyboard(selected_lang: str) -> Dict[str, Any]:
             prefix = "✅ " if code == selected_lang else ""
             row.append({"text": f"{prefix}{title}", "callback_data": f"lang:{code}"})
         rows.append(row)
+
     rows.append([{"text": "💳 Купить минуты", "callback_data": "buy:menu"}])
     rows.append([{"text": "📌 Баланс", "callback_data": "me:balance"}])
     return {"inline_keyboard": rows}
@@ -180,19 +231,22 @@ def format_status_text(user: User) -> str:
     return (
         "🎙 Голосовой переводчик\n\n"
         f"🌍 Язык перевода: {user.target_lang}\n"
-        f"🎁 Бесплатных переводов: {user.trial_left} (≤ {TRIAL_MAX_SECONDS} сек)\n"
+        f"🎁 Бесплатных переводов: {int(user.trial_left or 0)} (≤ {TRIAL_MAX_SECONDS} сек)\n"
         f"💳 Баланс: {bal_min} мин\n\n"
-        "Пришли голосовое сообщение — я переведу."
+        "Запиши голосовое — я переведу и пришлю озвучку."
     )
+
+
+def send_menu(chat_id: int, user: User, extra_text: Optional[str] = None):
+    text_ = extra_text if extra_text else format_status_text(user)
+    tg_send_message(chat_id, text_, reply_markup=build_main_keyboard(user.target_lang))
 
 
 # ============================================================
 # CRYPTOCLOUD HELPERS
 # ============================================================
-def env_missing() -> list:
+def env_missing_for_payments() -> list:
     missing = []
-    if not TELEGRAM_BOT_TOKEN:
-        missing.append("TELEGRAM_BOT_TOKEN")
     if not BASE_URL:
         missing.append("BASE_URL")
     if not CRYPTOCLOUD_API_KEY:
@@ -218,10 +272,12 @@ def cryptocloud_create_invoice(order_id: str, amount_usd: int, description: str)
         "success_url": f"{BASE_URL}/",
         "fail_url": f"{BASE_URL}/",
     }
+
     r = requests.post(CC_CREATE_INVOICE_URL, headers=headers, json=payload, timeout=30)
     ct = (r.headers.get("content-type") or "").lower()
     if "application/json" not in ct:
         return {"ok": False, "status": r.status_code, "raw": r.text}
+
     data = r.json()
     return {"ok": r.status_code == 200, "status": r.status_code, "data": data}
 
@@ -235,12 +291,107 @@ def verify_postback_token(token: str) -> Optional[dict]:
 
 
 # ============================================================
-# BUSINESS LOGIC
+# OPENAI HELPERS (REAL VOICE)
+# ============================================================
+def openai_headers() -> Dict[str, str]:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is missing")
+    return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+
+
+def ffmpeg_ogg_to_wav(ogg_path: str, wav_path: str):
+    """
+    Требует ffmpeg в контейнере.
+    """
+    cmd = ["ffmpeg", "-y", "-i", ogg_path, "-ar", "16000", "-ac", "1", wav_path]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        return p
+    except FileNotFoundError:
+        raise RuntimeError("ffmpeg not found in container. Install ffmpeg in Dockerfile.")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"ffmpeg convert failed: {e.stderr.decode('utf-8', errors='ignore')}")
+
+
+def openai_transcribe_wav(wav_path: str) -> str:
+    """
+    Whisper STT: /v1/audio/transcriptions
+    """
+    url = f"{OPENAI_BASE}/audio/transcriptions"
+    headers = openai_headers()
+    data = {"model": OPENAI_STT_MODEL}
+    with open(wav_path, "rb") as f:
+        files = {"file": ("audio.wav", f, "audio/wav")}
+        r = requests.post(url, headers=headers, data=data, files=files, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"STT failed HTTP {r.status_code}: {r.text}")
+    j = r.json()
+    text = j.get("text") or ""
+    return text.strip()
+
+
+def openai_translate_text(text: str, target_lang: str) -> str:
+    """
+    Перевод через chat completions.
+    """
+    url = f"{OPENAI_BASE}/chat/completions"
+    headers = openai_headers()
+    headers["Content-Type"] = "application/json"
+
+    system = (
+        "You are a professional translator. "
+        "Translate the user text accurately and naturally. "
+        "Return only the translation without quotes."
+    )
+    user = f"Target language: {target_lang}\n\nText:\n{text}"
+
+    payload = {
+        "model": OPENAI_TEXT_MODEL,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": 0.2,
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"Translate failed HTTP {r.status_code}: {r.text}")
+
+    j = r.json()
+    out = (j.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    return (out or "").strip()
+
+
+def openai_tts_to_ogg(text: str) -> bytes:
+    """
+    TTS: /v1/audio/speech
+    output=opus (Telegram-friendly)
+    """
+    url = f"{OPENAI_BASE}/audio/speech"
+    headers = openai_headers()
+    headers["Content-Type"] = "application/json"
+
+    payload = {
+        "model": OPENAI_TTS_MODEL,
+        "voice": OPENAI_TTS_VOICE,
+        "input": text,
+        "format": "opus",  # отдаёт opus контейнер (обычно подходит Telegram)
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"TTS failed HTTP {r.status_code}: {r.text}")
+
+    return r.content
+
+
+# ============================================================
+# BUSINESS LOGIC: USERS + BILLING
 # ============================================================
 def get_or_create_user(db, chat_id: int) -> User:
     user = db.get(User, int(chat_id))
     if user:
-        # safety defaults
         if user.target_lang is None:
             user.target_lang = "en"
         if user.trial_left is None:
@@ -272,46 +423,111 @@ def seconds_to_bill(duration: int) -> int:
 
 
 def can_use_trial(user: User, duration: int) -> bool:
-    return (user.trial_left or 0) > 0 and int(duration) <= TRIAL_MAX_SECONDS
+    return (int(user.trial_left or 0) > 0) and (int(duration) <= TRIAL_MAX_SECONDS)
 
 
-def debit_for_voice(db, user: User, duration: int) -> Tuple[bool, str, Dict[str, Any]]:
-    """
-    Корректная trial+paid логика, защита от отрицательного баланса.
-    Списание делаем ТОЛЬКО если проверка проходит.
-    Возвращает:
-    - ok
-    - message_if_not_ok
-    - debit_context (что списали), чтобы можно было логировать
-    """
+def check_can_process_voice(user: User, duration: int) -> Tuple[bool, str, Dict[str, Any]]:
     duration = int(duration or 0)
     bill = seconds_to_bill(duration)
-
-    if bill == 0:
+    if bill <= 0:
         return False, "Не вижу длительность аудио. Попробуй ещё раз.", {}
 
-    # Trial first
     if can_use_trial(user, duration):
-        user.trial_left = max(0, int(user.trial_left or 0) - 1)
-        user.updated_at = datetime.utcnow()
-        db.add(user)
-        db.commit()
         return True, "", {"mode": "trial", "billed_seconds": bill}
 
-    # Paid balance
     bal = int(user.balance_seconds or 0)
     if bal < bill:
         need_min = (bill - bal + 59) // 60
         return False, f"❌ Недостаточно минут. Нужно ещё примерно {need_min} мин.\nНажми «💳 Купить минуты».", {}
 
-    # Debit
-    user.balance_seconds = bal - bill
-    if user.balance_seconds < 0:
-        user.balance_seconds = 0  # hard guard
+    return True, "", {"mode": "paid", "billed_seconds": bill}
+
+
+def commit_debit_after_success(db, user: User, duration: int, ctx: Dict[str, Any]) -> None:
+    duration = int(duration or 0)
+    bill = int(ctx.get("billed_seconds") or seconds_to_bill(duration))
+    mode = ctx.get("mode")
+
+    if bill <= 0:
+        return
+
+    if mode == "trial":
+        user.trial_left = max(0, int(user.trial_left or 0) - 1)
+        user.updated_at = datetime.utcnow()
+        db.add(user)
+        db.commit()
+        return
+
+    bal = int(user.balance_seconds or 0)
+    new_bal = bal - bill
+    if new_bal < 0:
+        new_bal = 0
+    user.balance_seconds = new_bal
     user.updated_at = datetime.utcnow()
     db.add(user)
     db.commit()
-    return True, "", {"mode": "paid", "billed_seconds": bill}
+
+
+# ============================================================
+# ADMIN
+# ============================================================
+def is_admin(chat_id: int) -> bool:
+    return bool(ADMIN_ID) and str(chat_id) == str(ADMIN_ID)
+
+
+def build_stats_text(db) -> str:
+    users_total = db.query(func.count(User.telegram_id)).scalar() or 0
+    users_with_balance = db.query(func.count(User.telegram_id)).filter(User.balance_seconds > 0).scalar() or 0
+
+    created_cnt = db.query(func.count(Payment.id)).filter(Payment.status == "created").scalar() or 0
+    paid_cnt = db.query(func.count(Payment.id)).filter(Payment.status == "paid").scalar() or 0
+    credited_cnt = db.query(func.count(Payment.id)).filter(Payment.status == "credited").scalar() or 0
+
+    revenue_usd = db.query(func.coalesce(func.sum(Payment.amount_usd), 0)).filter(Payment.status == "credited").scalar() or 0
+
+    return (
+        "📊 Admin stats\n\n"
+        f"👤 Users total: {users_total}\n"
+        f"💳 Users with balance: {users_with_balance}\n\n"
+        f"🧾 Payments created: {created_cnt}\n"
+        f"✅ Payments paid: {paid_cnt}\n"
+        f"🏁 Payments credited: {credited_cnt}\n\n"
+        f"💰 Revenue (credited): ${revenue_usd}\n"
+    )
+
+
+# ============================================================
+# REAL VOICE PIPELINE
+# ============================================================
+def process_voice_real(file_id: str, target_lang: str) -> Tuple[str, bytes]:
+    """
+    Returns: (translated_text, tts_ogg_bytes)
+    """
+    file_path = tg_get_file_path(file_id)
+    ogg_bytes = tg_download_file(file_path)
+
+    with tempfile.TemporaryDirectory() as td:
+        ogg_path = os.path.join(td, "voice.ogg")
+        wav_path = os.path.join(td, "voice.wav")
+
+        with open(ogg_path, "wb") as f:
+            f.write(ogg_bytes)
+
+        # Convert to WAV
+        ffmpeg_ogg_to_wav(ogg_path, wav_path)
+
+        # STT
+        transcript = openai_transcribe_wav(wav_path)
+        if not transcript:
+            raise RuntimeError("Empty transcript")
+
+        # Translate
+        translated = openai_translate_text(transcript, target_lang)
+
+        # TTS (opus/ogg)
+        tts_bytes = openai_tts_to_ogg(translated)
+
+        return translated, tts_bytes
 
 
 # ============================================================
@@ -329,48 +545,6 @@ def startup():
 @app.get("/")
 def root():
     return {"ok": True, "service": "tg-voice-translator"}
-
-
-# ============================================================
-# ADMIN STATS
-# ============================================================
-def is_admin(chat_id: int) -> bool:
-    return bool(ADMIN_ID) and str(chat_id) == str(ADMIN_ID)
-
-
-def build_stats_text(db) -> str:
-    users_total = db.query(func.count(User.telegram_id)).scalar() or 0
-    users_with_balance = db.query(func.count(User.telegram_id)).filter(User.balance_seconds > 0).scalar() or 0
-
-    created_cnt = db.query(func.count(Payment.id)).filter(Payment.status == "created").scalar() or 0
-    paid_cnt = db.query(func.count(Payment.id)).filter(Payment.status == "paid").scalar() or 0
-    credited_cnt = db.query(func.count(Payment.id)).filter(Payment.status == "credited").scalar() or 0
-
-    # revenue по credited (можно и по paid, но credited точнее)
-    revenue_usd = db.query(func.coalesce(func.sum(Payment.amount_usd), 0)).filter(Payment.status == "credited").scalar() or 0
-
-    # топ пользователей по балансу
-    top = (
-        db.query(User.telegram_id, User.balance_seconds)
-        .order_by(User.balance_seconds.desc())
-        .limit(5)
-        .all()
-    )
-    top_lines = []
-    for tg_id, bal_sec in top:
-        top_lines.append(f"- {tg_id}: {int(bal_sec or 0)//60} мин")
-    top_text = "\n".join(top_lines) if top_lines else "-"
-
-    return (
-        "📊 Admin stats\n\n"
-        f"👤 Users total: {users_total}\n"
-        f"💳 Users with balance: {users_with_balance}\n\n"
-        f"🧾 Payments created: {created_cnt}\n"
-        f"✅ Payments paid: {paid_cnt}\n"
-        f"🏁 Payments credited: {credited_cnt}\n\n"
-        f"💰 Revenue (credited): ${revenue_usd}\n\n"
-        f"🏆 Top balances:\n{top_text}\n"
-    )
 
 
 # ============================================================
@@ -393,8 +567,8 @@ async def telegram_webhook(req: Request):
             with SessionLocal() as db:
                 user = get_or_create_user(db, int(chat_id))
 
-                if text_ == "/start":
-                    tg_send_message(chat_id, format_status_text(user), reply_markup=build_main_keyboard(user.target_lang))
+                if text_ in ("/start", "/menu"):
+                    send_menu(chat_id, user)
                     return JSONResponse({"ok": True})
 
                 if text_ == "/buy":
@@ -402,7 +576,7 @@ async def telegram_webhook(req: Request):
                     return JSONResponse({"ok": True})
 
                 if text_ == "/me":
-                    tg_send_message(chat_id, format_status_text(user), reply_markup=build_main_keyboard(user.target_lang))
+                    send_menu(chat_id, user)
                     return JSONResponse({"ok": True})
 
                 if text_ == "/stats":
@@ -414,33 +588,47 @@ async def telegram_webhook(req: Request):
 
                 # ---------------- VOICE ----------------
                 if "voice" in msg:
-                    duration = int((msg["voice"] or {}).get("duration") or 0)
+                    voice = msg["voice"] or {}
+                    duration = int(voice.get("duration") or 0)
+                    file_id = voice.get("file_id")
 
-                    ok, err_text, ctx = debit_for_voice(db, user, duration)
-                    if not ok:
-                        tg_send_message(chat_id, err_text, reply_markup=build_main_keyboard(user.target_lang))
+                    if not file_id:
+                        send_menu(chat_id, user, extra_text="Не могу получить file_id. Попробуй ещё раз.")
                         return JSONResponse({"ok": True})
 
-                    # Здесь должна быть твоя реальная логика:
-                    # - скачать audio file
-                    # - transcribe/translate/tts
-                    # Сейчас оставляем заглушку успешной обработки:
-                    mode = ctx.get("mode")
-                    billed = ctx.get("billed_seconds")
-                    remaining_min = max(0, int(user.balance_seconds or 0)) // 60
+                    ok, err_text, ctx = check_can_process_voice(user, duration)
+                    if not ok:
+                        send_menu(chat_id, user, extra_text=err_text)
+                        return JSONResponse({"ok": True})
 
-                    tg_send_message(
+                    # обработка: download -> ffmpeg -> stt -> translate -> tts
+                    try:
+                        translated_text, tts_ogg = process_voice_real(file_id, user.target_lang)
+                    except Exception as e:
+                        log.exception(f"voice processing failed: {e}")
+                        hint = ""
+                        if "ffmpeg not found" in str(e).lower():
+                            hint = "\n\n⚠️ В контейнере нет ffmpeg. Его нужно поставить в Dockerfile."
+                        send_menu(chat_id, user, extra_text=f"❌ Ошибка обработки: {e}{hint}")
+                        return JSONResponse({"ok": True})
+
+                    # списание после успеха
+                    commit_debit_after_success(db, user, duration, ctx)
+                    db.refresh(user)
+
+                    # отправляем озвучку
+                    tg_send_voice(
                         chat_id,
-                        f"✅ Перевод выполнен.\n"
-                        f"Списано: {billed} сек ({mode})\n"
-                        f"Баланс: {remaining_min} мин\n"
-                        f"Trial left: {user.trial_left}",
-                        reply_markup=build_main_keyboard(user.target_lang),
+                        tts_ogg,
+                        caption=f"✅ Перевод: {translated_text[:900]}",
                     )
+
+                    # возвращаем меню
+                    send_menu(chat_id, user)
                     return JSONResponse({"ok": True})
 
-                # default: show status
-                tg_send_message(chat_id, format_status_text(user), reply_markup=build_main_keyboard(user.target_lang))
+                # default: не даём меню пропасть
+                send_menu(chat_id, user)
                 return JSONResponse({"ok": True})
 
         # ------------- CALLBACK QUERY -------------
@@ -459,7 +647,7 @@ async def telegram_webhook(req: Request):
             with SessionLocal() as db:
                 user = get_or_create_user(db, int(chat_id))
 
-                # Language change
+                # Language
                 if data.startswith("lang:"):
                     lang = data.split(":", 1)[1].strip()
                     allowed = {c for _, c in LANGS}
@@ -469,34 +657,30 @@ async def telegram_webhook(req: Request):
                         db.add(user)
                         db.commit()
                         db.refresh(user)
-
-                    tg_send_message(chat_id, format_status_text(user), reply_markup=build_main_keyboard(user.target_lang))
+                    send_menu(chat_id, user)
                     return JSONResponse({"ok": True})
 
-                # Balance
                 if data == "me:balance":
-                    tg_send_message(chat_id, format_status_text(user), reply_markup=build_main_keyboard(user.target_lang))
+                    send_menu(chat_id, user)
                     return JSONResponse({"ok": True})
 
-                # Buy menu
                 if data == "buy:menu":
                     tg_send_message(chat_id, "💳 Выбери пакет минут:", reply_markup=build_packages_keyboard())
                     return JSONResponse({"ok": True})
 
                 if data == "buy:back":
-                    tg_send_message(chat_id, format_status_text(user), reply_markup=build_main_keyboard(user.target_lang))
+                    send_menu(chat_id, user)
                     return JSONResponse({"ok": True})
 
-                # Buy package
                 if data.startswith("buy:"):
                     package_code = data.split(":", 1)[1].strip().upper()
                     if package_code not in PACKAGES:
-                        tg_send_message(chat_id, "Неизвестный пакет.", reply_markup=build_main_keyboard(user.target_lang))
+                        send_menu(chat_id, user, extra_text="Неизвестный пакет.")
                         return JSONResponse({"ok": True})
 
-                    missing = env_missing()
+                    missing = env_missing_for_payments()
                     if missing:
-                        tg_send_message(chat_id, f"Ошибка: env vars missing: {', '.join(missing)}")
+                        send_menu(chat_id, user, extra_text=f"Ошибка: env vars missing: {', '.join(missing)}")
                         return JSONResponse({"ok": True})
 
                     amount_usd = int(PACKAGES[package_code]["usd"])
@@ -505,10 +689,13 @@ async def telegram_webhook(req: Request):
 
                     cc = cryptocloud_create_invoice(order_id, amount_usd, description)
                     if not cc["ok"]:
-                        tg_send_message(
+                        send_menu(
                             chat_id,
-                            f"Ошибка создания счёта: {CC_CREATE_INVOICE_URL} -> HTTP {cc.get('status')}\n"
-                            f"{cc.get('raw') or cc.get('data')}"
+                            user,
+                            extra_text=(
+                                f"Ошибка создания счёта: {CC_CREATE_INVOICE_URL} -> HTTP {cc.get('status')}\n"
+                                f"{cc.get('raw') or cc.get('data')}"
+                            ),
                         )
                         return JSONResponse({"ok": True})
 
@@ -518,10 +705,9 @@ async def telegram_webhook(req: Request):
                     pay_url = result.get("link") or result.get("pay_url") or result.get("url")
 
                     if not invoice_uuid:
-                        tg_send_message(chat_id, f"CryptoCloud ответ без invoice uuid: {data_json}")
+                        send_menu(chat_id, user, extra_text=f"CryptoCloud ответ без invoice uuid: {data_json}")
                         return JSONResponse({"ok": True})
 
-                    # Save payment
                     try:
                         p = Payment(
                             telegram_id=int(chat_id),
@@ -543,9 +729,8 @@ async def telegram_webhook(req: Request):
                         kb = {"inline_keyboard": [[{"text": "Перейти к оплате ✅", "url": pay_url}]]}
                         tg_send_message(
                             chat_id,
-                            f"Счёт создан.\nПакет: {package_code}\nСумма: ${amount_usd}\n\n"
-                            "Нажми кнопку ниже, чтобы оплатить:",
-                            reply_markup=kb
+                            f"Счёт создан.\nПакет: {package_code}\nСумма: ${amount_usd}\n\nНажми кнопку ниже:",
+                            reply_markup=kb,
                         )
                     else:
                         tg_send_message(chat_id, f"Счёт создан: {invoice_uuid}\n(В ответе не было ссылки оплаты)")
@@ -553,7 +738,7 @@ async def telegram_webhook(req: Request):
                     return JSONResponse({"ok": True})
 
                 # fallback
-                tg_send_message(chat_id, format_status_text(user), reply_markup=build_main_keyboard(user.target_lang))
+                send_menu(chat_id, user)
                 return JSONResponse({"ok": True})
 
         return JSONResponse({"ok": True})
@@ -617,7 +802,7 @@ async def cryptocloud_postback(req: Request):
 
             current_status = (pay.status or "").lower().strip()
 
-            # idempotency: skip only if already credited
+            # идемпотентность: credited = уже начислили
             if current_status == "credited":
                 log.info("Already credited, skip")
                 return PlainTextResponse("ok", status_code=200)
@@ -630,11 +815,9 @@ async def cryptocloud_postback(req: Request):
                 log.info(f"Status not paid: {pay.status}")
                 return PlainTextResponse("ok", status_code=200)
 
-            # paid => credit
             pkg_code = (pay.package_code or "").strip().upper()
             pkg = PACKAGES.get(pkg_code)
 
-            # mark paid (visible)
             pay.status = "paid"
             pay.updated_at = datetime.utcnow()
             db.add(pay)
@@ -681,8 +864,7 @@ async def cryptocloud_postback(req: Request):
 
             tg_send_message(
                 int(user.telegram_id),
-                f"✅ Оплата получена!\nПакет: {pkg_code}\nНачислено: {pkg['minutes']} мин\n"
-                f"Баланс: {after // 60} мин",
+                f"✅ Оплата получена!\nПакет: {pkg_code}\nНачислено: {pkg['minutes']} мин\nБаланс: {after // 60} мин",
                 reply_markup=build_main_keyboard(user.target_lang),
             )
 
