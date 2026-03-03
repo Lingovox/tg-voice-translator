@@ -477,7 +477,7 @@ def landing():
         </p>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
           {f'<a class="btn" href="{bot_link}" target="_blank" rel="noreferrer">Open Telegram bot ↗</a>' if bot_link else '<span class="badge">Set <code>BOT_USERNAME</code> to show bot link</span>'}
-          <span class="badge">Callback URL: <code>{postback_url}</code></span>
+          
         </div>
 
         <h2>Supported languages</h2>
