@@ -211,6 +211,8 @@ def build_main_keyboard(selected_lang: str) -> Dict[str, Any]:
 
     rows.append([{"text": "💳 Buy minutes", "callback_data": "buy:menu"}])
     rows.append([{"text": "📌 Balance", "callback_data": "me:balance"}])
+    rows.append([{"text": "💬 Support", "callback_data": "support"}])
+
     return {"inline_keyboard": rows}
 
 
@@ -544,6 +546,65 @@ async def telegram_webhook(req: Request):
             with SessionLocal() as db:
                 user = get_or_create_user(db, int(chat_id))
 
+                # --- Support ticket: user replies to our Support prompt ---
+                if "reply_to_message" in msg:
+                    rt = msg.get("reply_to_message") or {}
+                    rt_text = (rt.get("text") or "").strip()
+                    if rt_text.startswith("💬 Support request"):
+                        if not ADMIN_ID:
+                            tg_send_message(chat_id, "Support is not configured. Please try later.")
+                            return JSONResponse({"ok": True})
+
+                        user_from = msg.get("from") or {}
+                        username = user_from.get("username")
+                        first_name = user_from.get("first_name", "")
+                        last_name = user_from.get("last_name", "")
+                        display_name = (first_name + " " + last_name).strip() or "User"
+                        user_tag = f"@{username}" if username else "(no username)"
+
+                        body = (msg.get("text") or "").strip()
+                        if not body:
+                            tg_send_message(chat_id, "Please describe your issue as text (one message).")
+                            return JSONResponse({"ok": True})
+
+                        # Send to admin
+                        tg_send_message(
+                            int(ADMIN_ID),
+                            "🆘 Support ticket\n"
+                            f"From: {display_name} {user_tag}\n"
+                            f"telegram_id: {chat_id}\n\n"
+                            f"Message:\n{body}"
+                        )
+                        # Forward the original message too (keeps Telegram context)
+                        try:
+                            tg_request("forwardMessage", {
+                                "chat_id": int(ADMIN_ID),
+                                "from_chat_id": int(chat_id),
+                                "message_id": int(msg["message_id"]),
+                            })
+                        except Exception:
+                            pass
+
+                        tg_send_message(chat_id, "✅ Got it! Your message was sent to support.")
+                        return JSONResponse({"ok": True})
+
+                if text_ == "/support":
+                    if not ADMIN_ID:
+                        tg_send_message(chat_id, "Support is not configured. Please try later.")
+                        return JSONResponse({"ok": True})
+
+                    tg_send_message(
+                        chat_id,
+                        "💬 Support request\n\n"
+                        "Please reply to THIS message with:\n"
+                        "- what happened\n"
+                        "- (optional) Order ID / Invoice ID\n\n"
+                        "I will receive it and respond.",
+                        reply_markup={"force_reply": True, "input_field_placeholder": "Describe your issue…"},
+                    )
+                    return JSONResponse({"ok": True})
+
+
                 if text_ in ("/start", "/menu"):
                     send_menu(chat_id, user)
                     return JSONResponse({"ok": True})
@@ -620,6 +681,23 @@ async def telegram_webhook(req: Request):
 
             with SessionLocal() as db:
                 user = get_or_create_user(db, int(chat_id))
+
+                if data == "support":
+                    if not ADMIN_ID:
+                        tg_send_message(chat_id, "Support is not configured. Please try later.")
+                        return JSONResponse({"ok": True})
+
+                    tg_send_message(
+                        chat_id,
+                        "💬 Support request\n\n"
+                        "Please reply to THIS message with:\n"
+                        "- what happened\n"
+                        "- (optional) Order ID / Invoice ID\n\n"
+                        "I will receive it and respond.",
+                        reply_markup={"force_reply": True, "input_field_placeholder": "Describe your issue…"},
+                    )
+                    return JSONResponse({"ok": True})
+
 
                 if data.startswith("lang:"):
                     lang = data.split(":", 1)[1].strip()
