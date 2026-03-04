@@ -1017,3 +1017,85 @@ async def cryptocloud_postback(req: Request):
     except Exception as e:
         log.exception("postback error")
         return PlainTextResponse(f"error: {e}", status_code=200)
+@app.get("/terms", response_class=HTMLResponse)
+def terms():
+    return """
+    <!doctype html>
+    <html>
+    <head>
+        <title>Lingovox Terms of Service</title>
+        <meta charset="utf-8">
+    </head>
+    <body style="font-family:Arial;max-width:900px;margin:auto;padding:40px;">
+        <h1>Terms of Service</h1>
+
+        <p>Lingovox is an AI-powered Telegram bot that translates voice messages and returns translated voice responses.</p>
+
+        <h2>Service Description</h2>
+        <p>The service allows users to send voice messages which are automatically transcribed, translated into a selected language, and returned as voice audio.</p>
+
+        <h2>Free Trial</h2>
+        <p>New users may receive a limited number of free trial messages.</p>
+
+        <h2>Paid Usage</h2>
+        <p>After the free trial is used, users may purchase additional minutes inside the Telegram bot. Purchased minutes are consumed based on the duration of processed audio.</p>
+
+        <h2>Payments</h2>
+        <p>Payments are processed through third-party payment providers. Lingovox does not store payment card or cryptocurrency wallet details.</p>
+
+        <h2>Refund Policy</h2>
+        <p>Used minutes are non-refundable. If minutes were not credited due to a technical issue, users may contact support.</p>
+
+        <h2>Service Availability</h2>
+        <p>We strive to keep the service operational but cannot guarantee uninterrupted availability.</p>
+
+        <h2>Support</h2>
+        <p>Support is available inside the Telegram bot via the <b>/support</b> command.</p>
+
+    </body>
+    </html>
+    """
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy():
+    return """
+    <!doctype html>
+    <html>
+    <head>
+        <title>Lingovox Privacy Policy</title>
+        <meta charset="utf-8">
+    </head>
+    <body style="font-family:Arial;max-width:900px;margin:auto;padding:40px;">
+        <h1>Privacy Policy</h1>
+
+        <p>This privacy policy explains how Lingovox collects and uses information when users interact with the Telegram bot.</p>
+
+        <h2>Information We Collect</h2>
+        <p>We store limited information required to operate the service:</p>
+
+        <ul>
+            <li>Telegram user ID</li>
+            <li>Selected language preferences</li>
+            <li>Trial usage counters</li>
+            <li>Purchased balance in minutes</li>
+        </ul>
+
+        <h2>Voice Processing</h2>
+        <p>Voice messages are processed to generate translations and voice responses. Audio data may be processed by AI service providers.</p>
+
+        <h2>Payments</h2>
+        <p>Payments are handled by third-party payment providers. Lingovox does not store payment card details or cryptocurrency wallet information.</p>
+
+        <h2>Data Protection</h2>
+        <p>We take reasonable measures to protect user data and limit stored information to what is necessary for the service to function.</p>
+
+        <h2>Third-Party Services</h2>
+        <p>The service may use external APIs for speech recognition, translation, and voice synthesis.</p>
+
+        <h2>Contact</h2>
+        <p>If you have questions about this policy, please contact support inside the Telegram bot.</p>
+
+    </body>
+    </html>
+    """
