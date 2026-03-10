@@ -60,10 +60,10 @@ NP_CREATE_INVOICE_URL = "https://api.nowpayments.io/v1/invoice"
 POSTBACK_PATH = "/payments/nowpayments"
 
 PACKAGES = {
-    "P30": {"usd": 3, "minutes": 30},
-    "P60": {"usd": 8, "minutes": 60},
-    "P180": {"usd": 20, "minutes": 180},
-    "P600": {"usd": 50, "minutes": 600},
+"P30": {"usd": 10, "minutes": 30},
+"P60": {"usd": 15, "minutes": 60},
+"P180": {"usd": 30, "minutes": 180},
+"P600": {"usd": 70, "minutes": 600},
 }
 
 LANGS = [
@@ -188,17 +188,17 @@ def build_main_keyboard(selected_lang: str) -> Dict[str, Any]:
     rows.append([{"text": "🆘 Support", "callback_data": "support:menu"}])
     return {"inline_keyboard": rows}
 
-
 def build_packages_keyboard() -> Dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "30 min — $3", "callback_data": "buy:P30"}],
-            [{"text": "60 min — $8", "callback_data": "buy:P60"}],
-            [{"text": "180 min — $20", "callback_data": "buy:P180"}],
-            [{"text": "600 min — $50", "callback_data": "buy:P600"}],
+            [{"text": "30 min — $10", "callback_data": "buy:P30"}],
+            [{"text": "60 min — $15", "callback_data": "buy:P60"}],
+            [{"text": "180 min — $30", "callback_data": "buy:P180"}],
+            [{"text": "600 min — $70", "callback_data": "buy:P600"}],
             [{"text": "⬅️ Back", "callback_data": "buy:back"}],
         ]
     }
+        
 
 
 def format_status_text(user: User) -> str:
