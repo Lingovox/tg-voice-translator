@@ -2,11 +2,12 @@ import os
 import time
 import json
 import logging
+import hashlib
+import hmac
 from datetime import datetime
 from typing import Optional, Dict, Any, Tuple
 
 import requests
-import jwt
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
@@ -36,13 +37,12 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-CRYPTOCLOUD_API_KEY = os.getenv("CRYPTOCLOUD_API_KEY", "").strip()
-CRYPTOCLOUD_SHOP_ID = os.getenv("CRYPTOCLOUD_SHOP_ID", "").strip()
-CRYPTOCLOUD_SECRET_KEY = os.getenv("CRYPTOCLOUD_SECRET_KEY", "").strip()
+NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()
+NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "").strip()
 
 TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "5"))
-TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "60"))  # free message max duration
-MIN_BILLABLE_SECONDS = int(os.getenv("MIN_BILLABLE_SECONDS", "1"))  # safety
+TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "60"))
+MIN_BILLABLE_SECONDS = int(os.getenv("MIN_BILLABLE_SECONDS", "1"))
 
 
 # ============================
@@ -56,15 +56,12 @@ if not TELEGRAM_BOT_TOKEN:
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
-# CryptoCloud v1 endpoints (IMPORTANT: without /api/v1)
-CC_CREATE_INVOICE_URL = "https://api.cryptocloud.plus/v1/invoice/create"
+NP_CREATE_INVOICE_URL = "https://api.nowpayments.io/v1/invoice"
+POSTBACK_PATH = "/payments/nowpayments"
 
-POSTBACK_PATH = "/payments/cryptocloud/postback"
-
-# Packages: code -> {usd, minutes}
 PACKAGES = {
-    "P30":  {"usd": 3,  "minutes": 30},
-    "P60":  {"usd": 8,  "minutes": 60},
+    "P30": {"usd": 3, "minutes": 30},
+    "P60": {"usd": 8, "minutes": 60},
     "P180": {"usd": 20, "minutes": 180},
     "P600": {"usd": 50, "minutes": 600},
 }
@@ -96,16 +93,9 @@ class User(Base):
 
     telegram_id = Column(BigInteger, primary_key=True, index=True, nullable=False)
     target_lang = Column(String, nullable=False, default="en")
-
-    # how many free messages left
     trial_left = Column(Integer, nullable=False, default=TRIAL_LIMIT)
-
-    # optional counter (used by your schema)
     trial_messages = Column(Integer, nullable=False, default=0)
-
-    # paid balance in seconds
     balance_seconds = Column(Integer, nullable=False, default=0)
-
     is_subscribed = Column(Boolean, nullable=False, default=False)
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -123,7 +113,7 @@ class Payment(Base):
 
     package_code = Column(String, nullable=False)
     amount_usd = Column(Integer, nullable=False)
-    status = Column(String, nullable=False, default="created")  # created / paid / success / failed ...
+    status = Column(String, nullable=False, default="created")
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -135,7 +125,7 @@ class SupportTicket(Base):
     id = Column(Integer, primary_key=True, index=True)
     telegram_id = Column(BigInteger, nullable=False, index=True)
     message = Column(String, nullable=False)
-    status = Column(String, nullable=False, default="open")  # open/closed
+    status = Column(String, nullable=False, default="open")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -223,57 +213,63 @@ def format_status_text(user: User) -> str:
 
 
 # ============================
-# CryptoCloud helpers
+# NOWPayments helpers
 # ============================
 def env_missing() -> list:
     missing = []
-    if not CRYPTOCLOUD_API_KEY:
-        missing.append("CRYPTOCLOUD_API_KEY")
-    if not CRYPTOCLOUD_SHOP_ID:
-        missing.append("CRYPTOCLOUD_SHOP_ID")
-    if not CRYPTOCLOUD_SECRET_KEY:
-        missing.append("CRYPTOCLOUD_SECRET_KEY")
+    if not NOWPAYMENTS_API_KEY:
+        missing.append("NOWPAYMENTS_API_KEY")
+    if not NOWPAYMENTS_IPN_SECRET:
+        missing.append("NOWPAYMENTS_IPN_SECRET")
     if not BASE_URL:
         missing.append("BASE_URL")
     return missing
 
 
-def cryptocloud_create_invoice(order_id: str, amount_usd: int, description: str) -> Dict[str, Any]:
+def nowpayments_create_invoice(order_id: str, amount_usd: int, description: str) -> Dict[str, Any]:
     headers = {
-        "Authorization": f"Token {CRYPTOCLOUD_API_KEY}",
+        "x-api-key": NOWPAYMENTS_API_KEY,
         "Content-Type": "application/json",
     }
+
     payload = {
-        "shop_id": CRYPTOCLOUD_SHOP_ID,
-        "amount": amount_usd,
-        "currency": "USD",
+        "price_amount": amount_usd,
+        "price_currency": "usd",
+        "pay_currency": "usdttrc20",
         "order_id": order_id,
-        "comment": description,
+        "order_description": description,
+        "ipn_callback_url": f"{BASE_URL}{POSTBACK_PATH}",
         "success_url": f"{BASE_URL}/",
-        "fail_url": f"{BASE_URL}/",
+        "cancel_url": f"{BASE_URL}/",
+        "is_fixed_rate": False,
+        "is_fee_paid_by_user": False,
     }
 
-    r = requests.post(CC_CREATE_INVOICE_URL, headers=headers, json=payload, timeout=30)
+    r = requests.post(NP_CREATE_INVOICE_URL, headers=headers, json=payload, timeout=30)
 
     ct = (r.headers.get("content-type") or "").lower()
     if "application/json" not in ct:
         return {"ok": False, "status": r.status_code, "raw": r.text}
 
     data = r.json()
-    return {"ok": r.status_code == 200, "status": r.status_code, "data": data}
+    return {"ok": r.status_code in (200, 201), "status": r.status_code, "data": data}
 
 
-def verify_postback_token(token: str) -> Optional[dict]:
-    try:
-        decoded = jwt.decode(token, CRYPTOCLOUD_SECRET_KEY, algorithms=["HS256"])
-        return decoded
-    except Exception as e:
-        log.warning(f"JWT verify failed: {e}")
-        return None
+def verify_nowpayments_signature(raw_body: bytes, signature: str) -> bool:
+    if not NOWPAYMENTS_IPN_SECRET or not signature:
+        return False
+
+    calculated = hmac.new(
+        NOWPAYMENTS_IPN_SECRET.encode("utf-8"),
+        raw_body,
+        hashlib.sha512,
+    ).hexdigest()
+
+    return hmac.compare_digest(calculated, signature)
 
 
 # ============================
-# OpenAI helpers (HTTP)
+# OpenAI helpers
 # ============================
 def _openai_headers() -> Dict[str, str]:
     if not OPENAI_API_KEY:
@@ -284,9 +280,6 @@ def _openai_headers() -> Dict[str, str]:
 
 
 def openai_transcribe(ogg_bytes: bytes) -> str:
-    """
-    Uses OpenAI Audio Transcriptions API (multipart).
-    """
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = _openai_headers()
     files = {
@@ -302,9 +295,6 @@ def openai_transcribe(ogg_bytes: bytes) -> str:
 
 
 def openai_translate_text(text: str, target_lang: str) -> str:
-    """
-    Simple translation via Responses API.
-    """
     url = "https://api.openai.com/v1/responses"
     headers = _openai_headers()
     headers["Content-Type"] = "application/json"
@@ -314,13 +304,16 @@ def openai_translate_text(text: str, target_lang: str) -> str:
         f"Return only the translation, no quotes, no extra commentary.\n\n"
         f"Text:\n{text}"
     )
+
     payload = {
         "model": "gpt-4.1-mini",
         "input": prompt,
     }
+
     r = requests.post(url, headers=headers, json=payload, timeout=90)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI translate failed: HTTP {r.status_code}: {r.text}")
+
     data = r.json()
     out = ""
     for item in data.get("output", []):
@@ -328,14 +321,12 @@ def openai_translate_text(text: str, target_lang: str) -> str:
             for c in item.get("content", []):
                 if c.get("type") == "output_text":
                     out += c.get("text", "")
+
     out = out.strip()
     return out or "(empty translation)"
 
 
 def openai_tts(text: str) -> bytes:
-    """
-    TTS: return audio bytes (ogg/opus).
-    """
     url = "https://api.openai.com/v1/audio/speech"
     headers = _openai_headers()
     headers["Content-Type"] = "application/json"
@@ -346,9 +337,11 @@ def openai_tts(text: str) -> bytes:
         "format": "ogg",
         "input": text,
     }
+
     r = requests.post(url, headers=headers, json=payload, timeout=90)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI TTS failed: HTTP {r.status_code}: {r.text}")
+
     return r.content
 
 
@@ -356,13 +349,6 @@ def openai_tts(text: str) -> bytes:
 # Billing logic
 # ============================
 def decide_billing(user: User, voice_seconds: int) -> Tuple[str, int]:
-    """
-    Returns (mode, seconds_to_charge):
-      mode in {"trial", "paid", "deny"}
-    Trial: only if user.trial_left > 0 AND voice_seconds <= TRIAL_MAX_SECONDS
-    Paid: if user.balance_seconds >= voice_seconds (or >= MIN_BILLABLE_SECONDS) -> charge full voice_seconds
-    Deny: otherwise
-    """
     voice_seconds = int(max(0, voice_seconds))
     if voice_seconds < MIN_BILLABLE_SECONDS:
         voice_seconds = MIN_BILLABLE_SECONDS
@@ -422,11 +408,9 @@ def startup():
 
 @app.get("/", response_class=HTMLResponse)
 def landing():
-    """Simple one-page landing for compliance/review."""
     bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
-    postback_url = f"{BASE_URL}{POSTBACK_PATH}" if BASE_URL else POSTBACK_PATH
-
     langs = ", ".join([name for name, _ in LANGS])
+
     html = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -435,23 +419,20 @@ def landing():
   <title>Lingovox — AI Voice Translator</title>
   <style>
     :root {{
-      --bg:#0b1020; --card:#111a33; --text:#e9eefc; --muted:#a9b4d6; --accent:#7c5cff;
-      --ok:#38d39f; --warn:#ffcc66; --border:rgba(255,255,255,.10);
+      --bg:#0b1020; --card:#111a33; --text:#e9eefc; --muted:#a9b4d6; --border:rgba(255,255,255,.10);
     }}
     *{{box-sizing:border-box}}
-    body{{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial; background:linear-gradient(180deg,#0b1020,#070a14); color:var(--text)}}
+    body{{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial;background:linear-gradient(180deg,#0b1020,#070a14);color:var(--text)}}
     a{{color:var(--text)}}
     .wrap{{max-width:980px;margin:0 auto;padding:28px 16px 60px}}
     .hero{{display:grid;gap:16px;grid-template-columns:1.4fr 1fr;align-items:stretch}}
     @media (max-width:860px){{.hero{{grid-template-columns:1fr}}}}
-    .card{{background:rgba(17,26,51,.85); border:1px solid var(--border); border-radius:18px; padding:18px; box-shadow:0 10px 40px rgba(0,0,0,.25)}}
+    .card{{background:rgba(17,26,51,.85);border:1px solid var(--border);border-radius:18px;padding:18px;box-shadow:0 10px 40px rgba(0,0,0,.25)}}
     h1{{margin:0 0 6px;font-size:34px;letter-spacing:-.02em}}
     h2{{margin:22px 0 10px;font-size:18px}}
     p{{margin:8px 0;color:var(--muted);line-height:1.55}}
     .badge{{display:inline-flex;gap:8px;align-items:center;border:1px solid var(--border);border-radius:999px;padding:6px 10px;color:var(--muted);font-size:13px}}
-    .btn{{display:inline-flex;gap:10px;align-items:center;justify-content:center;
-          padding:12px 14px;border-radius:12px;border:1px solid var(--border);
-          background:rgba(124,92,255,.16); text-decoration:none}}
+    .btn{{display:inline-flex;gap:10px;align-items:center;justify-content:center;padding:12px 14px;border-radius:12px;border:1px solid var(--border);background:rgba(124,92,255,.16);text-decoration:none}}
     .btn:hover{{background:rgba(124,92,255,.22)}}
     .grid{{display:grid;gap:12px;grid-template-columns:repeat(3,1fr)}}
     @media (max-width:860px){{.grid{{grid-template-columns:1fr}}}}
@@ -459,9 +440,8 @@ def landing():
     .kpi b{{display:block;font-size:15px}}
     .kpi span{{color:var(--muted);font-size:13px}}
     .price{{display:flex;justify-content:space-between;align-items:center;padding:12px 14px;border:1px solid var(--border);border-radius:14px;background:rgba(0,0,0,.15)}}
-    .price b{{font-size:14px}}
     .footer{{margin-top:18px;color:var(--muted);font-size:12px;line-height:1.55}}
-    code{{background:rgba(0,0,0,.25); padding:2px 6px; border-radius:8px; border:1px solid var(--border)}}
+    code{{background:rgba(0,0,0,.25);padding:2px 6px;border-radius:8px;border:1px solid var(--border)}}
   </style>
 </head>
 <body>
@@ -477,7 +457,6 @@ def landing():
         </p>
         <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:12px;">
           {f'<a class="btn" href="{bot_link}" target="_blank" rel="noreferrer">Open Telegram bot ↗</a>' if bot_link else '<span class="badge">Set <code>BOT_USERNAME</code> to show bot link</span>'}
-          
         </div>
 
         <h2>Supported languages</h2>
@@ -501,23 +480,19 @@ def landing():
         <p>New users get <b>{TRIAL_LIMIT}</b> free messages (each up to <b>{TRIAL_MAX_SECONDS} seconds</b>).</p>
 
         <h2 style="margin-top:18px;">Support</h2>
-        <p>
-          In the bot, use <code>/support</code> to create a support ticket.<br/>
-          Admins can use <code>/stat</code> for statistics.
-        </p>
+        <p>In the bot, use <code>/support</code> to create a support ticket.<br/>Admins can use <code>/stat</code> for statistics.</p>
       </div>
     </div>
 
     <div class="card" style="margin-top:14px;">
       <div class="grid">
         <div class="kpi"><b>Data & privacy</b><span>We process voice to generate translation and TTS. We do not sell personal data.</span></div>
-        <div class="kpi"><b>Payments</b><span>Payments are processed by CryptoCloud. Minutes are credited after confirmation (postback).</span></div>
-        <div class="kpi"><b>Reliability</b><span>Duplicate postbacks are ignored. Balance never goes negative.</span></div>
+        <div class="kpi"><b>Payments</b><span>Payments are processed by NOWPayments. Minutes are credited after payment confirmation.</span></div>
+        <div class="kpi"><b>Reliability</b><span>Duplicate payment notifications are ignored. Balance never goes negative.</span></div>
       </div>
 
       <div class="footer">
-        <p><b>Terms.</b> Translations may contain errors. Service is provided “as is”.
-        Refunds are handled case-by-case for duplicated charges or technical issues.</p>
+        <p><b>Terms.</b> Translations may contain errors. Service is provided “as is”. Refunds are handled case-by-case for duplicated charges or technical issues.</p>
       </div>
     </div>
   </div>
@@ -536,9 +511,6 @@ async def telegram_webhook(req: Request):
     update = await req.json()
 
     try:
-        # ----------------------------
-        # MESSAGE
-        # ----------------------------
         if "message" in update:
             msg = update["message"]
             chat_id = msg.get("chat", {}).get("id")
@@ -547,7 +519,6 @@ async def telegram_webhook(req: Request):
             if not chat_id:
                 return JSONResponse({"ok": True})
 
-            # /start
             if text == "/start":
                 with SessionLocal() as db:
                     user = db.get(User, int(chat_id))
@@ -567,12 +538,10 @@ async def telegram_webhook(req: Request):
                     tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
                 return JSONResponse({"ok": True})
 
-            # /buy
             if text == "/buy":
                 tg_send_message(chat_id, "💳 Choose a minutes package:", reply_markup=build_packages_keyboard())
                 return JSONResponse({"ok": True})
 
-            # /support
             if text.startswith("/support"):
                 tg_send_message(
                     chat_id,
@@ -580,7 +549,6 @@ async def telegram_webhook(req: Request):
                 )
                 return JSONResponse({"ok": True})
 
-            # /stat (admin only)
             if text == "/stat":
                 if not is_admin(int(chat_id)):
                     tg_send_message(chat_id, "⛔ This command is for admin only.")
@@ -589,7 +557,7 @@ async def telegram_webhook(req: Request):
                 with SessionLocal() as db:
                     users_count = db.query(User).count()
                     payments_count = db.query(Payment).count()
-                    paid_count = db.query(Payment).filter(Payment.status.in_(["paid", "success"])).count()
+                    paid_count = db.query(Payment).filter(Payment.status.in_(["paid", "finished", "success"])).count()
                     open_tickets = db.query(SupportTicket).filter(SupportTicket.status == "open").count()
 
                 tg_send_message(
@@ -602,7 +570,6 @@ async def telegram_webhook(req: Request):
                 )
                 return JSONResponse({"ok": True})
 
-            # admin reply to ticket: /reply <ticket_id> <text>
             if text.startswith("/reply"):
                 if not is_admin(int(chat_id)):
                     tg_send_message(chat_id, "⛔ This command is for admin only.")
@@ -622,7 +589,6 @@ async def telegram_webhook(req: Request):
                         tg_send_message(chat_id, "Ticket not found.")
                         return JSONResponse({"ok": True})
 
-                    # send message to user
                     tg_send_message(
                         int(ticket.telegram_id),
                         f"✅ Support reply (ticket #{ticket.id}):\n{reply_text}"
@@ -636,7 +602,6 @@ async def telegram_webhook(req: Request):
                 tg_send_message(chat_id, f"✅ Replied and closed ticket #{ticket_id}.")
                 return JSONResponse({"ok": True})
 
-            # Create ticket: "/support ..."
             if text.lower().startswith("/support "):
                 ticket_text = text.split(" ", 1)[1].strip()
                 if not ticket_text:
@@ -665,7 +630,6 @@ async def telegram_webhook(req: Request):
                 )
                 return JSONResponse({"ok": True})
 
-            # Handle VOICE
             if "voice" in msg:
                 voice = msg["voice"]
                 file_id = voice.get("file_id")
@@ -674,7 +638,6 @@ async def telegram_webhook(req: Request):
                 if not file_id:
                     return JSONResponse({"ok": True})
 
-                # Ensure user exists
                 with SessionLocal() as db:
                     user = db.get(User, int(chat_id))
                     if not user:
@@ -689,7 +652,6 @@ async def telegram_webhook(req: Request):
                         db.commit()
                         db.refresh(user)
 
-                    # billing decision
                     mode, seconds_to_charge = decide_billing(user, duration)
                     if mode == "deny":
                         kb = build_main_keyboard(user.target_lang)
@@ -704,8 +666,6 @@ async def telegram_webhook(req: Request):
                         )
                         return JSONResponse({"ok": True})
 
-                # Download voice from Telegram
-                # 1) getFile
                 gf = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30).json()
                 if not gf.get("ok"):
                     tg_send_message(chat_id, f"Failed to get file: {gf}")
@@ -715,17 +675,30 @@ async def telegram_webhook(req: Request):
                 file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
                 audio = requests.get(file_url, timeout=60).content
 
-                # OpenAI pipeline
                 try:
+                    with SessionLocal() as db:
+                        user = db.get(User, int(chat_id))
+                        if not user:
+                            user = User(
+                                telegram_id=int(chat_id),
+                                target_lang="en",
+                                trial_left=TRIAL_LIMIT,
+                                trial_messages=0,
+                                balance_seconds=0,
+                            )
+                            db.add(user)
+                            db.commit()
+                            db.refresh(user)
+                        target_lang = user.target_lang
+
                     original_text = openai_transcribe(audio)
-                    translated_text = openai_translate_text(original_text, user.target_lang)
+                    translated_text = openai_translate_text(original_text, target_lang)
                     tts_audio = openai_tts(translated_text)
                 except Exception as e:
                     log.exception("Voice pipeline error")
                     tg_send_message(chat_id, f"⚠️ Error while processing voice: {e}")
                     return JSONResponse({"ok": True})
 
-                # Apply billing after successful processing
                 with SessionLocal() as db:
                     user = db.get(User, int(chat_id))
                     if not user:
@@ -742,7 +715,6 @@ async def telegram_webhook(req: Request):
 
                     mode, seconds_to_charge = decide_billing(user, duration)
                     if mode == "deny":
-                        # race condition safety
                         kb = build_main_keyboard(user.target_lang)
                         tg_send_message(chat_id, "⛔ Not enough balance (re-check).", reply_markup=kb)
                         return JSONResponse({"ok": True})
@@ -756,19 +728,14 @@ async def telegram_webhook(req: Request):
                     if mode == "trial":
                         caption = f"🎁 Trial message used. Free left: {user.trial_left}"
                     elif mode == "paid":
-                        caption = f"💳 Charged: {seconds_to_charge}s. Balance: {max(0, int(user.balance_seconds))//60} min"
+                        caption = f"💳 Charged: {seconds_to_charge}s. Balance: {max(0, int(user.balance_seconds)) // 60} min"
 
-                # Send voice response
                 tg_send_voice(chat_id, tts_audio, caption=caption)
-                # Also update status menu (optional)
                 tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
                 return JSONResponse({"ok": True})
 
             return JSONResponse({"ok": True})
 
-        # ----------------------------
-        # CALLBACK
-        # ----------------------------
         if "callback_query" in update:
             cq = update["callback_query"]
             data = cq.get("data", "")
@@ -778,7 +745,6 @@ async def telegram_webhook(req: Request):
             if not chat_id:
                 return JSONResponse({"ok": True})
 
-            # language switch
             if data.startswith("lang:"):
                 lang = data.split(":", 1)[1].strip()
                 with SessionLocal() as db:
@@ -801,7 +767,6 @@ async def telegram_webhook(req: Request):
                 tg_answer_callback(cq_id)
                 return JSONResponse({"ok": True})
 
-            # support menu
             if data == "support:menu":
                 tg_send_message(
                     chat_id,
@@ -810,7 +775,6 @@ async def telegram_webhook(req: Request):
                 tg_answer_callback(cq_id)
                 return JSONResponse({"ok": True})
 
-            # buy menu
             if data == "buy:menu":
                 tg_send_message(chat_id, "💳 Choose a minutes package:", reply_markup=build_packages_keyboard())
                 tg_answer_callback(cq_id)
@@ -829,7 +793,6 @@ async def telegram_webhook(req: Request):
                 tg_answer_callback(cq_id)
                 return JSONResponse({"ok": True})
 
-            # buy package
             if data.startswith("buy:"):
                 package_code = data.split(":", 1)[1].strip()
                 if package_code not in PACKAGES:
@@ -847,32 +810,44 @@ async def telegram_webhook(req: Request):
                 order_id = f"{chat_id}_{package_code}_{int(time.time())}"
                 description = f"Minutes package {package_code} for user {chat_id}"
 
-                cc = cryptocloud_create_invoice(order_id=order_id, amount_usd=amount_usd, description=description)
-                if not cc["ok"]:
+                np = nowpayments_create_invoice(
+                    order_id=order_id,
+                    amount_usd=amount_usd,
+                    description=description,
+                )
+
+                if not np["ok"]:
                     tg_send_message(
                         chat_id,
-                        f"Invoice create failed: {CC_CREATE_INVOICE_URL}\nHTTP {cc.get('status')}\n{cc.get('raw') or cc.get('data')}"
+                        f"Invoice create failed\nHTTP {np.get('status')}\n{np.get('raw') or np.get('data')}"
                     )
                     tg_answer_callback(cq_id)
                     return JSONResponse({"ok": True})
 
-                data_json = cc["data"]
-                result = data_json.get("result") or data_json.get("data") or data_json
-                invoice_uuid = result.get("uuid") or result.get("invoice_id") or result.get("id")
-                pay_url = result.get("link") or result.get("pay_url") or result.get("url")
+                data_json = np["data"]
+                invoice_id = (
+                    data_json.get("id")
+                    or data_json.get("invoice_id")
+                    or data_json.get("payment_id")
+                    or data_json.get("token_id")
+                )
+                pay_url = (
+                    data_json.get("invoice_url")
+                    or data_json.get("pay_url")
+                    or data_json.get("url")
+                )
 
-                if not invoice_uuid:
-                    tg_send_message(chat_id, f"CryptoCloud response without invoice id:\n{data_json}")
+                if not invoice_id:
+                    tg_send_message(chat_id, f"NOWPayments response without invoice id:\n{data_json}")
                     tg_answer_callback(cq_id)
                     return JSONResponse({"ok": True})
 
-                # store payment (invoice_id is NOT NULL!)
                 with SessionLocal() as db:
                     try:
                         p = Payment(
                             telegram_id=int(chat_id),
                             order_id=order_id,
-                            invoice_id=str(invoice_uuid),
+                            invoice_id=str(invoice_id),
                             package_code=package_code,
                             amount_usd=int(amount_usd),
                             status="created",
@@ -896,9 +871,13 @@ async def telegram_webhook(req: Request):
                             [{"text": "Go to payment ✅", "url": pay_url}],
                         ]
                     }
-                    tg_send_message(chat_id, f"✅ Invoice created.\nAmount: ${amount_usd}\nPackage: {package_code}", reply_markup=kb)
+                    tg_send_message(
+                        chat_id,
+                        f"✅ Invoice created.\nAmount: ${amount_usd}\nPackage: {package_code}",
+                        reply_markup=kb
+                    )
                 else:
-                    tg_send_message(chat_id, f"✅ Invoice created: {invoice_uuid}\n(No payment link in response)")
+                    tg_send_message(chat_id, f"✅ Invoice created: {invoice_id}\n(No payment link in response)")
 
                 tg_answer_callback(cq_id)
                 return JSONResponse({"ok": True})
@@ -914,69 +893,51 @@ async def telegram_webhook(req: Request):
 
 
 @app.post(POSTBACK_PATH)
-async def cryptocloud_postback(req: Request):
+async def nowpayments_postback(req: Request):
     raw = await req.body()
+    signature = req.headers.get("x-nowpayments-sig", "")
+
+    if not verify_nowpayments_signature(raw, signature):
+        log.warning("Invalid NOWPayments signature")
+        return PlainTextResponse("invalid signature", status_code=200)
+
     try:
         payload = json.loads(raw.decode("utf-8"))
     except Exception:
-        try:
-            payload = json.loads(raw)
-        except Exception:
-            return PlainTextResponse("bad json", status_code=200)
+        return PlainTextResponse("bad json", status_code=200)
 
     try:
-        status = (payload.get("status") or "").lower()
+        payment_status = str(payload.get("payment_status") or "").lower()
         order_id = payload.get("order_id")
-        token = payload.get("token")
+        payment_id = payload.get("payment_id") or payload.get("id") or payload.get("invoice_id")
 
-        if not token:
-            return PlainTextResponse("no token", status_code=200)
-
-        decoded = verify_postback_token(token)
-        if not decoded:
-            return PlainTextResponse("bad token", status_code=200)
-
-        token_invoice_id = decoded.get("id")
-
-        postback_invoice_id = payload.get("invoice_id")
-        invoice_info = payload.get("invoice_info") or {}
-        invoice_uuid = invoice_info.get("uuid")
-
-        effective_invoice_id = invoice_uuid or postback_invoice_id or token_invoice_id
-
-        is_paid = status in ("success", "paid")
-        invoice_status = (invoice_info.get("invoice_status") or "").lower()
-        if invoice_status in ("success", "paid"):
-            is_paid = True
+        paid_statuses = {"finished", "confirmed", "sending", "partially_paid", "paid"}
 
         with SessionLocal() as db:
             p = None
             if order_id:
-                p = db.query(Payment).filter(Payment.order_id == order_id).first()
-            if not p and effective_invoice_id:
-                p = db.query(Payment).filter(Payment.invoice_id == str(effective_invoice_id)).first()
+                p = db.query(Payment).filter(Payment.order_id == str(order_id)).first()
+            if not p and payment_id:
+                p = db.query(Payment).filter(Payment.invoice_id == str(payment_id)).first()
 
             if not p:
-                log.warning(f"Payment not found for order_id={order_id} invoice_id={effective_invoice_id}")
+                log.warning(f"Payment not found for order_id={order_id}, payment_id={payment_id}")
                 return PlainTextResponse("payment not found", status_code=200)
 
-            if (p.status or "").lower() in ("paid", "success"):
-                log.info("Already paid, skip")
+            if (p.status or "").lower() in ("paid", "finished", "success", "confirmed"):
+                log.info("Already credited, skip duplicate IPN")
                 return PlainTextResponse("ok", status_code=200)
 
-            if not is_paid:
-                p.status = status or "unknown"
-                p.updated_at = datetime.utcnow()
-                db.add(p)
-                db.commit()
+            p.status = payment_status or "unknown"
+            p.updated_at = datetime.utcnow()
+            db.add(p)
+            db.commit()
+
+            if payment_status not in paid_statuses:
                 return PlainTextResponse("ok", status_code=200)
 
             pkg = PACKAGES.get(p.package_code)
             if not pkg:
-                p.status = "paid"
-                p.updated_at = datetime.utcnow()
-                db.add(p)
-                db.commit()
                 return PlainTextResponse("ok", status_code=200)
 
             add_seconds = int(pkg["minutes"] * 60)
@@ -1015,8 +976,10 @@ async def cryptocloud_postback(req: Request):
         return PlainTextResponse("ok", status_code=200)
 
     except Exception as e:
-        log.exception("postback error")
+        log.exception("NOWPayments postback error")
         return PlainTextResponse(f"error: {e}", status_code=200)
+
+
 @app.get("/terms", response_class=HTMLResponse)
 def terms():
     return """
