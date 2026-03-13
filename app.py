@@ -13,7 +13,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 
 from sqlalchemy import (
-    create_engine, Column, Integer, BigInteger, String, Boolean, DateTime
+    create_engine, Column, Integer, BigInteger, String, Boolean, DateTime, text as sql_text
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import IntegrityError
@@ -80,6 +80,15 @@ LANGS = [
 ]
 
 
+CONVERSATION_PAIRS = {
+    "ru_es": {"a": "ru", "b": "es", "label": "Русский ↔ Español"},
+    "ru_en": {"a": "ru", "b": "en", "label": "Русский ↔ English"},
+    "ru_de": {"a": "ru", "b": "de", "label": "Русский ↔ Deutsch"},
+}
+
+LANGUAGE_NAMES = {code: title for title, code in LANGS}
+
+
 # ============================
 # DB
 # ============================
@@ -97,6 +106,8 @@ class User(Base):
     trial_messages = Column(Integer, nullable=False, default=0)
     balance_seconds = Column(Integer, nullable=False, default=0)
     is_subscribed = Column(Boolean, nullable=False, default=False)
+    mode = Column(String, nullable=False, default="translate")
+    conversation_pair = Column(String, nullable=False, default="ru_es")
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -132,6 +143,18 @@ class SupportTicket(Base):
 
 def init_db():
     Base.metadata.create_all(bind=engine)
+    ensure_user_columns()
+
+
+def ensure_user_columns():
+    """Add new columns for existing deployments without migrations."""
+    statements = [
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'translate' NOT NULL",
+        "ALTER TABLE users ADD COLUMN IF NOT EXISTS conversation_pair VARCHAR DEFAULT 'ru_es' NOT NULL",
+    ]
+    with engine.begin() as conn:
+        for stmt in statements:
+            conn.execute(sql_text(stmt))
 
 
 # ============================
@@ -174,8 +197,15 @@ def tg_answer_callback(callback_query_id: str, text: Optional[str] = None):
     return tg_request("answerCallbackQuery", payload)
 
 
-def build_main_keyboard(selected_lang: str) -> Dict[str, Any]:
-    rows = []
+def build_main_keyboard(selected_lang: str, mode: str = "translate", pair_code: str = "ru_es") -> Dict[str, Any]:
+    mode_prefix = "✅ " if mode == "conversation" else ""
+    pair_label = CONVERSATION_PAIRS.get(pair_code, CONVERSATION_PAIRS["ru_es"])["label"]
+
+    rows = [
+        [{"text": f"{mode_prefix}🗣 Conversation mode", "callback_data": "mode:conversation"}],
+        [{"text": f"🌐 Pair: {pair_label}", "callback_data": "pair:menu"}],
+    ]
+
     for i in range(0, len(LANGS), 2):
         pair = LANGS[i:i + 2]
         row = []
@@ -201,10 +231,66 @@ def build_packages_keyboard() -> Dict[str, Any]:
         
 
 
+def build_pair_keyboard(selected_pair: str) -> Dict[str, Any]:
+    rows = []
+    for pair_code, pair in CONVERSATION_PAIRS.items():
+        prefix = "✅ " if pair_code == selected_pair else ""
+        rows.append([{"text": f"{prefix}{pair['label']}", "callback_data": f"pair:{pair_code}"}])
+    rows.append([{"text": "⬅️ Back", "callback_data": "pair:back"}])
+    return {"inline_keyboard": rows}
+
+
+def get_or_create_user(db, telegram_id: int) -> User:
+    user = db.get(User, int(telegram_id))
+    if not user:
+        user = User(
+            telegram_id=int(telegram_id),
+            target_lang="en",
+            trial_left=TRIAL_LIMIT,
+            trial_messages=0,
+            balance_seconds=0,
+            mode="translate",
+            conversation_pair="ru_es",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    return user
+
+
+def pair_label(pair_code: str) -> str:
+    return CONVERSATION_PAIRS.get(pair_code, CONVERSATION_PAIRS["ru_es"])["label"]
+
+
+def format_mode_label(mode: str) -> str:
+    return "conversation" if mode == "conversation" else "translate"
+
+
+def resolve_conversation_target(detected_lang: str, pair_code: str) -> Tuple[Optional[str], Optional[str]]:
+    pair = CONVERSATION_PAIRS.get(pair_code, CONVERSATION_PAIRS["ru_es"])
+    lang_a = pair["a"]
+    lang_b = pair["b"]
+    if detected_lang == lang_a:
+        return lang_a, lang_b
+    if detected_lang == lang_b:
+        return lang_b, lang_a
+    return None, None
+
+
+def parse_transcription_result(payload: Dict[str, Any]) -> Tuple[str, str]:
+    text_value = (payload.get("text") or "").strip()
+    language = str(payload.get("language") or "").strip().lower()
+    return text_value, language
+
+
 def format_status_text(user: User) -> str:
     bal_min = max(0, int(user.balance_seconds or 0)) // 60
+    mode_line = "🗣 Mode: Conversation" if user.mode == "conversation" else "🎤 Mode: Voice translate"
+    pair_line = f"🔀 Conversation pair: {pair_label(user.conversation_pair)}"
     return (
         "🎙 Lingovox — AI voice translator\n\n"
+        f"{mode_line}\n"
+        f"{pair_line}\n"
         f"🌍 Target language: {user.target_lang}\n"
         f"🎁 Free messages left: {user.trial_left} (≤ {TRIAL_MAX_SECONDS}s)\n"
         f"💳 Balance: {bal_min} min\n\n"
@@ -279,7 +365,7 @@ def _openai_headers() -> Dict[str, str]:
     }
 
 
-def openai_transcribe(ogg_bytes: bytes) -> str:
+def openai_transcribe(ogg_bytes: bytes) -> Dict[str, Any]:
     url = "https://api.openai.com/v1/audio/transcriptions"
     headers = _openai_headers()
     files = {
@@ -290,17 +376,18 @@ def openai_transcribe(ogg_bytes: bytes) -> str:
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI transcribe failed: HTTP {r.status_code}: {r.text}")
     data = r.json()
-    text = data.get("text") or ""
-    return text.strip()
+    return data
 
 
-def openai_translate_text(text: str, target_lang: str) -> str:
+def openai_translate_text(text: str, target_lang: str, source_lang: Optional[str] = None) -> str:
     url = "https://api.openai.com/v1/responses"
     headers = _openai_headers()
     headers["Content-Type"] = "application/json"
 
     prompt = (
-        f"Translate the following text to {target_lang}.\n"
+        f"Translate the following text"
+        f" from {source_lang if source_lang else 'auto-detected source language'}"
+        f" to {target_lang}.\n"
         f"Return only the translation, no quotes, no extra commentary.\n\n"
         f"Text:\n{text}"
     )
@@ -521,20 +608,8 @@ async def telegram_webhook(req: Request):
 
             if text == "/start":
                 with SessionLocal() as db:
-                    user = db.get(User, int(chat_id))
-                    if not user:
-                        user = User(
-                            telegram_id=int(chat_id),
-                            target_lang="en",
-                            trial_left=TRIAL_LIMIT,
-                            trial_messages=0,
-                            balance_seconds=0,
-                        )
-                        db.add(user)
-                        db.commit()
-                        db.refresh(user)
-
-                    kb = build_main_keyboard(user.target_lang)
+                    user = get_or_create_user(db, int(chat_id))
+                    kb = build_main_keyboard(user.target_lang, user.mode, user.conversation_pair)
                     tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
                 return JSONResponse({"ok": True})
 
@@ -639,22 +714,11 @@ async def telegram_webhook(req: Request):
                     return JSONResponse({"ok": True})
 
                 with SessionLocal() as db:
-                    user = db.get(User, int(chat_id))
-                    if not user:
-                        user = User(
-                            telegram_id=int(chat_id),
-                            target_lang="en",
-                            trial_left=TRIAL_LIMIT,
-                            trial_messages=0,
-                            balance_seconds=0,
-                        )
-                        db.add(user)
-                        db.commit()
-                        db.refresh(user)
+                    user = get_or_create_user(db, int(chat_id))
 
                     mode, seconds_to_charge = decide_billing(user, duration)
                     if mode == "deny":
-                        kb = build_main_keyboard(user.target_lang)
+                        kb = build_main_keyboard(user.target_lang, user.mode, user.conversation_pair)
                         bal_min = max(0, int(user.balance_seconds or 0)) // 60
                         tg_send_message(
                             chat_id,
@@ -677,22 +741,25 @@ async def telegram_webhook(req: Request):
 
                 try:
                     with SessionLocal() as db:
-                        user = db.get(User, int(chat_id))
-                        if not user:
-                            user = User(
-                                telegram_id=int(chat_id),
-                                target_lang="en",
-                                trial_left=TRIAL_LIMIT,
-                                trial_messages=0,
-                                balance_seconds=0,
-                            )
-                            db.add(user)
-                            db.commit()
-                            db.refresh(user)
+                        user = get_or_create_user(db, int(chat_id))
                         target_lang = user.target_lang
+                        pair_code = user.conversation_pair
+                        user_mode = user.mode
 
-                    original_text = openai_transcribe(audio)
-                    translated_text = openai_translate_text(original_text, target_lang)
+                    transcription = openai_transcribe(audio)
+                    original_text, detected_lang = parse_transcription_result(transcription)
+                    if not original_text:
+                        raise RuntimeError("Speech was not recognized")
+
+                    if user_mode == "conversation":
+                        source_lang, conv_target_lang = resolve_conversation_target(detected_lang, pair_code)
+                        if not source_lang or not conv_target_lang:
+                            raise RuntimeError(
+                                f"Detected language '{detected_lang or 'unknown'}' is outside selected pair {pair_label(pair_code)}"
+                            )
+                        translated_text = openai_translate_text(original_text, conv_target_lang, source_lang=source_lang)
+                    else:
+                        translated_text = openai_translate_text(original_text, target_lang, source_lang=detected_lang or None)
                     tts_audio = openai_tts(translated_text)
                 except Exception as e:
                     log.exception("Voice pipeline error")
@@ -700,22 +767,11 @@ async def telegram_webhook(req: Request):
                     return JSONResponse({"ok": True})
 
                 with SessionLocal() as db:
-                    user = db.get(User, int(chat_id))
-                    if not user:
-                        user = User(
-                            telegram_id=int(chat_id),
-                            target_lang="en",
-                            trial_left=TRIAL_LIMIT,
-                            trial_messages=0,
-                            balance_seconds=0,
-                        )
-                        db.add(user)
-                        db.commit()
-                        db.refresh(user)
+                    user = get_or_create_user(db, int(chat_id))
 
                     mode, seconds_to_charge = decide_billing(user, duration)
                     if mode == "deny":
-                        kb = build_main_keyboard(user.target_lang)
+                        kb = build_main_keyboard(user.target_lang, user.mode, user.conversation_pair)
                         tg_send_message(chat_id, "⛔ Not enough balance (re-check).", reply_markup=kb)
                         return JSONResponse({"ok": True})
 
@@ -723,14 +779,26 @@ async def telegram_webhook(req: Request):
                     db.commit()
                     db.refresh(user)
 
-                    kb = build_main_keyboard(user.target_lang)
+                    kb = build_main_keyboard(user.target_lang, user.mode, user.conversation_pair)
                     caption = None
                     if mode == "trial":
                         caption = f"🎁 Trial message used. Free left: {user.trial_left}"
                     elif mode == "paid":
                         caption = f"💳 Charged: {seconds_to_charge}s. Balance: {max(0, int(user.balance_seconds)) // 60} min"
 
+                    info_text = None
+                    if user.mode == "conversation":
+                        info_text = (
+                            f"🗣 Conversation mode\n"
+                            f"Pair: {pair_label(user.conversation_pair)}\n"
+                            f"Detected language: {detected_lang or 'unknown'}\n\n"
+                            f"Original:\n{original_text}\n\n"
+                            f"Translation:\n{translated_text}"
+                        )
+
                 tg_send_voice(chat_id, tts_audio, caption=caption)
+                if info_text:
+                    tg_send_message(chat_id, info_text)
                 tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
                 return JSONResponse({"ok": True})
 
@@ -748,12 +816,7 @@ async def telegram_webhook(req: Request):
             if data.startswith("lang:"):
                 lang = data.split(":", 1)[1].strip()
                 with SessionLocal() as db:
-                    user = db.get(User, int(chat_id))
-                    if not user:
-                        user = User(telegram_id=int(chat_id), target_lang="en", trial_left=TRIAL_LIMIT)
-                        db.add(user)
-                        db.commit()
-                        db.refresh(user)
+                    user = get_or_create_user(db, int(chat_id))
 
                     user.target_lang = lang
                     user.updated_at = datetime.utcnow()
@@ -761,9 +824,66 @@ async def telegram_webhook(req: Request):
                     db.commit()
                     db.refresh(user)
 
-                    kb = build_main_keyboard(user.target_lang)
+                    kb = build_main_keyboard(user.target_lang, user.mode, user.conversation_pair)
                     tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
 
+                tg_answer_callback(cq_id)
+                return JSONResponse({"ok": True})
+
+            if data == "mode:conversation":
+                with SessionLocal() as db:
+                    user = get_or_create_user(db, int(chat_id))
+                    user.mode = "conversation"
+                    user.updated_at = datetime.utcnow()
+                    db.add(user)
+                    db.commit()
+                    db.refresh(user)
+
+                    kb = build_main_keyboard(user.target_lang, user.mode, user.conversation_pair)
+                    tg_send_message(
+                        chat_id,
+                        "🗣 Conversation mode enabled.\n\n"
+                        f"Selected pair: {pair_label(user.conversation_pair)}\n"
+                        "Now two people can speak one by one using one phone. "
+                        "The bot will detect which language from the selected pair was spoken and reply in the opposite language.",
+                        reply_markup=kb,
+                    )
+                tg_answer_callback(cq_id)
+                return JSONResponse({"ok": True})
+
+            if data == "pair:menu":
+                with SessionLocal() as db:
+                    user = get_or_create_user(db, int(chat_id))
+                tg_send_message(chat_id, "🌐 Choose a conversation pair:", reply_markup=build_pair_keyboard(user.conversation_pair))
+                tg_answer_callback(cq_id)
+                return JSONResponse({"ok": True})
+
+            if data == "pair:back":
+                with SessionLocal() as db:
+                    user = get_or_create_user(db, int(chat_id))
+                tg_send_message(chat_id, format_status_text(user), reply_markup=build_main_keyboard(user.target_lang, user.mode, user.conversation_pair))
+                tg_answer_callback(cq_id)
+                return JSONResponse({"ok": True})
+
+            if data.startswith("pair:"):
+                pair_code = data.split(":", 1)[1].strip()
+                if pair_code not in CONVERSATION_PAIRS:
+                    tg_answer_callback(cq_id, "Unknown pair")
+                    return JSONResponse({"ok": True})
+
+                with SessionLocal() as db:
+                    user = get_or_create_user(db, int(chat_id))
+                    user.conversation_pair = pair_code
+                    user.updated_at = datetime.utcnow()
+                    db.add(user)
+                    db.commit()
+                    db.refresh(user)
+
+                tg_send_message(
+                    chat_id,
+                    f"✅ Conversation pair updated: {pair_label(pair_code)}",
+                    reply_markup=build_main_keyboard(user.target_lang, user.mode, user.conversation_pair),
+                )
                 tg_answer_callback(cq_id)
                 return JSONResponse({"ok": True})
 
@@ -788,7 +908,7 @@ async def telegram_webhook(req: Request):
                         db.add(user)
                         db.commit()
                         db.refresh(user)
-                kb = build_main_keyboard(user.target_lang)
+                kb = build_main_keyboard(user.target_lang, user.mode, user.conversation_pair)
                 tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
                 tg_answer_callback(cq_id)
                 return JSONResponse({"ok": True})
@@ -942,18 +1062,7 @@ async def nowpayments_postback(req: Request):
 
             add_seconds = int(pkg["minutes"] * 60)
 
-            user = db.get(User, int(p.telegram_id))
-            if not user:
-                user = User(
-                    telegram_id=int(p.telegram_id),
-                    target_lang="en",
-                    trial_left=TRIAL_LIMIT,
-                    trial_messages=0,
-                    balance_seconds=0,
-                )
-                db.add(user)
-                db.commit()
-                db.refresh(user)
+            user = get_or_create_user(db, int(p.telegram_id))
 
             user.balance_seconds = max(0, int(user.balance_seconds or 0) + add_seconds)
             user.updated_at = datetime.utcnow()
@@ -970,7 +1079,7 @@ async def nowpayments_postback(req: Request):
             tg_send_message(
                 int(user.telegram_id),
                 f"✅ Payment received!\nPackage: {p.package_code}\nCredited: {pkg['minutes']} min\nBalance: {bal_min} min",
-                reply_markup=build_main_keyboard(user.target_lang),
+                reply_markup=build_main_keyboard(user.target_lang, user.mode, user.conversation_pair),
             )
 
         return PlainTextResponse("ok", status_code=200)
