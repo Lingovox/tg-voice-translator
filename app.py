@@ -36,6 +36,7 @@ ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini")
 
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "").strip()
