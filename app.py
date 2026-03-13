@@ -280,7 +280,51 @@ def resolve_conversation_target(detected_lang: str, pair_code: str) -> Tuple[Opt
 def parse_transcription_result(payload: Dict[str, Any]) -> Tuple[str, str]:
     text_value = (payload.get("text") or "").strip()
     language = str(payload.get("language") or "").strip().lower()
+
+    if language in {"", "unknown", "und", "null", "none"}:
+        language = ""
+
     return text_value, language
+
+
+def detect_language_within_pair(text: str, pair_code: str) -> str:
+    pair = CONVERSATION_PAIRS.get(pair_code, CONVERSATION_PAIRS["ru_es"])
+    lang_a = pair["a"]
+    lang_b = pair["b"]
+
+    url = "https://api.openai.com/v1/responses"
+    headers = _openai_headers()
+    headers["Content-Type"] = "application/json"
+
+    prompt = (
+        f"You must detect which language this text is written in. "
+        f"Answer with only one code: {lang_a} or {lang_b}. "
+        "Do not explain anything.\n\n"
+        f"Text:\n{text}"
+    )
+
+    payload = {
+        "model": OPENAI_TEXT_MODEL,
+        "input": prompt,
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI language detect failed: HTTP {r.status_code}: {r.text}")
+
+    data = r.json()
+    out = ""
+    for item in data.get("output", []):
+        if item.get("type") == "message":
+            for c in item.get("content", []):
+                if c.get("type") == "output_text":
+                    out += c.get("text", "")
+
+    detected = out.strip().lower()
+    if detected not in {lang_a, lang_b}:
+        raise RuntimeError(f"Could not detect language within pair: {pair_label(pair_code)}")
+
+    return detected
 
 
 def format_status_text(user: User) -> str:
@@ -752,6 +796,9 @@ async def telegram_webhook(req: Request):
                         raise RuntimeError("Speech was not recognized")
 
                     if user_mode == "conversation":
+                        if not detected_lang:
+                            detected_lang = detect_language_within_pair(original_text, pair_code)
+
                         source_lang, conv_target_lang = resolve_conversation_target(detected_lang, pair_code)
                         if not source_lang or not conv_target_lang:
                             raise RuntimeError(
