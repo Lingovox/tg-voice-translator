@@ -119,16 +119,26 @@ def normalize_lang_code(value: str) -> str:
     return find_language_code_in_text(raw)
 
 
-def resolve_source_language(text: str, detected_lang: str, telegram_lang: str) -> str:
+def resolve_source_language(text: str, detected_lang: str, telegram_lang: str, prefer_text: bool = False) -> str:
     detected = normalize_lang_code(detected_lang)
-    if detected:
-        return detected
+
+    detected_from_text = ""
     try:
         detected_from_text = normalize_lang_code(detect_language_from_text(text))
     except Exception:
         detected_from_text = ""
-    if detected_from_text:
-        return detected_from_text
+
+    if prefer_text:
+        if detected_from_text:
+            return detected_from_text
+        if detected:
+            return detected
+    else:
+        if detected:
+            return detected
+        if detected_from_text:
+            return detected_from_text
+
     return normalize_lang_code(telegram_lang)
 
 
@@ -994,11 +1004,26 @@ async def telegram_webhook(req: Request):
                                     )
 
                                 source_text = message_text
-                                source_lang = resolve_source_language(source_text, detected_lang, telegram_lang)
+                                source_lang = resolve_source_language(
+                                    source_text,
+                                    detected_lang,
+                                    telegram_lang,
+                                    prefer_text=True
+                                )
                                 if not source_lang:
                                     raise RuntimeError(
                                         "Could not determine the source language for conversation setup."
                                     )
+
+                                if source_lang == target_lang:
+                                    fallback_source_lang = resolve_source_language(
+                                        source_text,
+                                        "",
+                                        telegram_lang,
+                                        prefer_text=True
+                                    )
+                                    if fallback_source_lang and fallback_source_lang != target_lang:
+                                        source_lang = fallback_source_lang
 
                                 if source_lang == target_lang:
                                     raise RuntimeError(
