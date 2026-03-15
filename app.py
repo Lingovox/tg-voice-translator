@@ -372,12 +372,17 @@ def openai_transcribe_verbose(ogg_bytes: bytes) -> Dict[str, Any]:
     files = {
         "file": ("audio.ogg", ogg_bytes, "audio/ogg"),
         "model": (None, "gpt-4o-mini-transcribe"),
-        "response_format": (None, "verbose_json"),
+        "response_format": (None, "json"),
     }
     r = requests.post(url, headers=headers, files=files, timeout=90)
     if r.status_code != 200:
         raise RuntimeError(f"OpenAI transcribe failed: HTTP {r.status_code}: {r.text}")
-    return r.json()
+    data = r.json()
+    if isinstance(data, dict) and "text" in data:
+        data["text"] = str(data.get("text") or "").strip()
+    if isinstance(data, dict) and "language" in data and data.get("language") is not None:
+        data["language"] = str(data.get("language") or "").strip().lower()
+    return data
 
 
 def _extract_output_text(data: Dict[str, Any]) -> str:
