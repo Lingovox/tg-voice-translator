@@ -1043,10 +1043,17 @@ async def telegram_webhook(req: Request):
                                     source_lang=source_lang
                                 )
                             else:
+                                incoming_lang = resolve_source_language(
+                                    original_text,
+                                    detected_lang,
+                                    "",
+                                    prefer_text=True
+                                )
+
                                 translate_to, resolved_incoming_lang = decide_conversation_target(
                                     source_lang,
                                     target_lang,
-                                    detected_lang,
+                                    incoming_lang,
                                     telegram_lang
                                 )
 
