@@ -785,13 +785,13 @@ def landing():
 
       <div class="card">
         <h2>Pricing (minutes)</h2>
-        <div class="price"><b>30 minutes</b><span>$3</span></div>
-        <div style="height:10px"></div>
-        <div class="price"><b>60 minutes</b><span>$8</span></div>
-        <div style="height:10px"></div>
-        <div class="price"><b>180 minutes</b><span>$20</span></div>
-        <div style="height:10px"></div>
-        <div class="price"><b>600 minutes</b><span>$50</span></div>
+        <div class="price"><b>30 minutes</b><span>$10</span></div>
+<div style="height:10px"></div>
+<div class="price"><b>60 minutes</b><span>$15</span></div>
+<div style="height:10px"></div>
+<div class="price"><b>180 minutes</b><span>$30</span></div>
+<div style="height:10px"></div>
+<div class="price"><b>600 minutes</b><span>$70</span></div>
 
         <h2 style="margin-top:18px;">Free trial</h2>
         <p>New users get <b>{TRIAL_LIMIT}</b> free messages (each up to <b>{TRIAL_MAX_SECONDS} seconds</b>).</p>
