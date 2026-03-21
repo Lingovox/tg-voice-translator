@@ -44,6 +44,7 @@ NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "").strip()
 
 PADDLE_API_KEY = os.getenv("PADDLE_API_KEY", "").strip()
 PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "").strip()
+PADDLE_CLIENT_TOKEN = os.getenv("PADDLE_CLIENT_TOKEN", "").strip()
 PADDLE_ENV = os.getenv("PADDLE_ENV", "live").strip().lower()
 
 PADDLE_PRICE_30 = os.getenv("PADDLE_PRICE_30", "").strip()
@@ -969,8 +970,14 @@ def health():
 
 
 @app.get("/pay", response_class=HTMLResponse)
-def paddle_pay_page():
-    return """<!doctype html>
+def paddle_pay_page(request: Request):
+    txn_id = (request.query_params.get("_ptxn") or "").strip()
+    env_name = "sandbox" if PADDLE_ENV == "sandbox" else "production"
+    success_url = f"{BASE_URL}/?paid=1" if BASE_URL else "/?paid=1"
+
+    if not txn_id:
+        return HTMLResponse(
+            """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -979,7 +986,69 @@ def paddle_pay_page():
 </head>
 <body style="font-family:Arial, sans-serif; padding:40px;">
   <h2>Lingovox payment</h2>
-  <p>This page is used by Paddle Checkout.</p>
+  <p>Transaction id is missing.</p>
+</body>
+</html>""",
+            status_code=400,
+        )
+
+    if not PADDLE_CLIENT_TOKEN:
+        return HTMLResponse(
+            """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lingovox Payment</title>
+</head>
+<body style="font-family:Arial, sans-serif; padding:40px;">
+  <h2>Lingovox payment</h2>
+  <p>PADDLE_CLIENT_TOKEN is not configured on the server.</p>
+</body>
+</html>""",
+            status_code=500,
+        )
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lingovox Payment</title>
+  <script src="https://cdn.paddle.com/paddle/v2/paddle.js"></script>
+</head>
+<body style="font-family:Arial, sans-serif; padding:40px;">
+  <h2>Lingovox payment</h2>
+  <p>Opening secure checkout...</p>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", function () {{
+      try {{
+        if ("{env_name}" === "sandbox") {{
+          Paddle.Environment.set("sandbox");
+        }}
+
+        Paddle.Initialize({{
+          token: "{PADDLE_CLIENT_TOKEN}",
+          eventCallback: function (event) {{
+            if (event && event.name === "checkout.completed") {{
+              window.location.href = "{success_url}";
+            }}
+          }}
+        }});
+
+        Paddle.Checkout.open({{
+          transactionId: "{txn_id}"
+        }});
+      }} catch (err) {{
+        document.body.insertAdjacentHTML(
+          "beforeend",
+          "<p style=\"color:#b00020; margin-top:16px;\">Checkout failed to open. Please try again later.</p>"
+        );
+        console.error(err);
+      }}
+    }});
+  </script>
 </body>
 </html>"""
 
