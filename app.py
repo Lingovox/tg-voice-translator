@@ -42,6 +42,15 @@ OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4.1-mini").strip()
 NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()
 NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "").strip()
 
+PADDLE_API_KEY = os.getenv("PADDLE_API_KEY", "").strip()
+PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "").strip()
+PADDLE_ENV = os.getenv("PADDLE_ENV", "live").strip().lower()
+
+PADDLE_PRICE_30 = os.getenv("PADDLE_PRICE_30", "").strip()
+PADDLE_PRICE_60 = os.getenv("PADDLE_PRICE_60", "").strip()
+PADDLE_PRICE_180 = os.getenv("PADDLE_PRICE_180", "").strip()
+PADDLE_PRICE_600 = os.getenv("PADDLE_PRICE_600", "").strip()
+
 TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "5"))
 TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "60"))
 MIN_BILLABLE_SECONDS = int(os.getenv("MIN_BILLABLE_SECONDS", "1"))
@@ -60,6 +69,16 @@ TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 NP_CREATE_INVOICE_URL = "https://api.nowpayments.io/v1/invoice"
 POSTBACK_PATH = "/payments/nowpayments"
+PADDLE_POSTBACK_PATH = "/payments/paddle"
+
+PADDLE_API_BASE = "https://api.paddle.com" if PADDLE_ENV == "live" else "https://sandbox-api.paddle.com"
+
+PADDLE_PRICES = {
+    "P30": PADDLE_PRICE_30,
+    "P60": PADDLE_PRICE_60,
+    "P180": PADDLE_PRICE_180,
+    "P600": PADDLE_PRICE_600,
+}
 
 PACKAGES = {
 "P30": {"usd": 10, "minutes": 30},
@@ -269,6 +288,8 @@ class Payment(Base):
 
     package_code = Column(String, nullable=False)
     amount_usd = Column(Integer, nullable=False)
+    provider = Column(String, nullable=False, default="nowpayments")
+    external_id = Column(String, nullable=True, unique=True)
     status = Column(String, nullable=False, default="created")
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -292,6 +313,8 @@ def init_db():
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'translate'")
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS conversation_source_lang VARCHAR")
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS conversation_target_lang VARCHAR")
+        conn.exec_driver_sql("ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider VARCHAR DEFAULT 'nowpayments'")
+        conn.exec_driver_sql("ALTER TABLE payments ADD COLUMN IF NOT EXISTS external_id VARCHAR")
 
 
 # ============================
@@ -359,14 +382,17 @@ def build_main_keyboard(selected_lang: str, mode: str = "translate", conversatio
 def build_packages_keyboard() -> Dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "30 min — $10", "callback_data": "buy:P30"}],
-            [{"text": "60 min — $15", "callback_data": "buy:P60"}],
-            [{"text": "180 min — $30", "callback_data": "buy:P180"}],
-            [{"text": "600 min — $70", "callback_data": "buy:P600"}],
+            [{"text": "💳 Card — 30 min — $10", "callback_data": "paddle:P30"}],
+            [{"text": "💳 Card — 60 min — $15", "callback_data": "paddle:P60"}],
+            [{"text": "💳 Card — 180 min — $30", "callback_data": "paddle:P180"}],
+            [{"text": "💳 Card — 600 min — $70", "callback_data": "paddle:P600"}],
+            [{"text": "💎 Crypto — 30 min — $10", "callback_data": "buy:P30"}],
+            [{"text": "💎 Crypto — 60 min — $15", "callback_data": "buy:P60"}],
+            [{"text": "💎 Crypto — 180 min — $30", "callback_data": "buy:P180"}],
+            [{"text": "💎 Crypto — 600 min — $70", "callback_data": "buy:P600"}],
             [{"text": "⬅️ Back", "callback_data": "buy:back"}],
         ]
     }
-        
 
 
 def format_status_text(user: User) -> str:
@@ -455,6 +481,125 @@ def verify_nowpayments_signature(raw_body: bytes, signature: str) -> bool:
     ).hexdigest()
 
     return hmac.compare_digest(calculated, signature)
+
+
+def paddle_env_missing() -> list:
+    missing = []
+    if not PADDLE_API_KEY:
+        missing.append("PADDLE_API_KEY")
+    if not PADDLE_WEBHOOK_SECRET:
+        missing.append("PADDLE_WEBHOOK_SECRET")
+    if not BASE_URL:
+        missing.append("BASE_URL")
+    return missing
+
+
+def paddle_headers() -> Dict[str, str]:
+    if not PADDLE_API_KEY:
+        raise RuntimeError("PADDLE_API_KEY is missing")
+    return {
+        "Authorization": f"Bearer {PADDLE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+
+def verify_paddle_signature(raw_body: bytes, signature_header: str, tolerance_seconds: int = 300) -> bool:
+    if not PADDLE_WEBHOOK_SECRET or not signature_header:
+        return False
+
+    pairs = {}
+    for part in signature_header.split(";"):
+        if "=" not in part:
+            continue
+        k, v = part.split("=", 1)
+        pairs.setdefault(k.strip(), []).append(v.strip())
+
+    ts = (pairs.get("ts") or [None])[0]
+    signatures = pairs.get("h1") or []
+    if not ts or not signatures:
+        return False
+
+    try:
+        if abs(time.time() - int(ts)) > tolerance_seconds:
+            return False
+    except Exception:
+        return False
+
+    signed_payload = ts.encode("utf-8") + b":" + raw_body
+    expected = hmac.new(
+        PADDLE_WEBHOOK_SECRET.encode("utf-8"),
+        signed_payload,
+        hashlib.sha256,
+    ).hexdigest()
+
+    return any(hmac.compare_digest(expected, sig) for sig in signatures)
+
+
+def paddle_create_transaction(package_code: str, telegram_id: int) -> Dict[str, Any]:
+    price_id = (PADDLE_PRICES.get(package_code) or "").strip()
+    if not price_id:
+        raise RuntimeError(f"Paddle price is not configured for package {package_code}")
+
+    order_id = f"pdl_{telegram_id}_{package_code}_{int(time.time())}"
+
+    payload = {
+        "items": [{"price_id": price_id, "quantity": 1}],
+        "custom_data": {
+            "telegram_id": str(telegram_id),
+            "package_code": package_code,
+            "order_id": order_id,
+        },
+        "checkout": {
+            "url": f"{BASE_URL}/pay",
+            "success_url": f"{BASE_URL}/?paid=1",
+        },
+    }
+
+    r = requests.post(
+        f"{PADDLE_API_BASE}/transactions",
+        headers=paddle_headers(),
+        json=payload,
+        timeout=30,
+    )
+
+    ct = (r.headers.get("content-type") or "").lower()
+    if "application/json" not in ct:
+        return {"ok": False, "status": r.status_code, "raw": r.text}
+
+    data = r.json()
+    ok = r.status_code in (200, 201)
+    return {"ok": ok, "status": r.status_code, "data": data, "order_id": order_id}
+
+
+def credit_payment_if_needed(db, payment: Payment) -> bool:
+    if (payment.status or "").lower() == "paid":
+        return False
+
+    pkg = PACKAGES.get(payment.package_code)
+    if not pkg:
+        return False
+
+    add_seconds = int(pkg["minutes"] * 60)
+
+    user = ensure_user(db, int(payment.telegram_id))
+    user.balance_seconds = max(0, int(user.balance_seconds or 0) + add_seconds)
+    user.updated_at = datetime.utcnow()
+
+    payment.status = "paid"
+    payment.updated_at = datetime.utcnow()
+
+    db.add(user)
+    db.add(payment)
+    db.commit()
+    db.refresh(user)
+
+    bal_min = max(0, int(user.balance_seconds or 0)) // 60
+    tg_send_message(
+        int(user.telegram_id),
+        f"✅ Payment received!\nPackage: {payment.package_code}\nCredited: {pkg['minutes']} min\nBalance: {bal_min} min",
+        reply_markup=user_keyboard(user),
+    )
+    return True
 
 
 # ============================
@@ -804,7 +949,7 @@ def landing():
     <div class="card" style="margin-top:14px;">
       <div class="grid">
         <div class="kpi"><b>Data & privacy</b><span>We process voice to generate translation and TTS. We do not sell personal data.</span></div>
-        <div class="kpi"><b>Payments</b><span>Payments are processed by NOWPayments. Minutes are credited after payment confirmation.</span></div>
+        <div class="kpi"><b>Payments</b><span>Payments are processed by Paddle (cards) and NOWPayments (crypto). Minutes are credited after payment confirmation.</span></div>
         <div class="kpi"><b>Reliability</b><span>Duplicate payment notifications are ignored. Balance never goes negative.</span></div>
       </div>
 
@@ -821,6 +966,22 @@ def landing():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/pay", response_class=HTMLResponse)
+def paddle_pay_page():
+    return """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Lingovox Payment</title>
+</head>
+<body style="font-family:Arial, sans-serif; padding:40px;">
+  <h2>Lingovox payment</h2>
+  <p>This page is used by Paddle Checkout.</p>
+</body>
+</html>"""
 
 
 @app.post("/telegram/webhook")
@@ -1258,6 +1419,82 @@ async def telegram_webhook(req: Request):
                 tg_answer_callback(cq_id)
                 return JSONResponse({"ok": True})
 
+            if data.startswith("paddle:"):
+                package_code = data.split(":", 1)[1].strip()
+                if package_code not in PACKAGES:
+                    tg_send_message(chat_id, "Unknown package.")
+                    tg_answer_callback(cq_id)
+                    return JSONResponse({"ok": True})
+
+                missing = paddle_env_missing()
+                if missing:
+                    tg_send_message(chat_id, f"Missing Paddle env vars: {', '.join(missing)}")
+                    tg_answer_callback(cq_id)
+                    return JSONResponse({"ok": True})
+
+                try:
+                    txn = paddle_create_transaction(package_code=package_code, telegram_id=int(chat_id))
+                except Exception as e:
+                    tg_send_message(chat_id, f"Paddle transaction error: {e}")
+                    tg_answer_callback(cq_id)
+                    return JSONResponse({"ok": True})
+
+                if not txn["ok"]:
+                    tg_send_message(
+                        chat_id,
+                        f"Paddle checkout create failed\nHTTP {txn.get('status')}\n{txn.get('raw') or txn.get('data')}"
+                    )
+                    tg_answer_callback(cq_id)
+                    return JSONResponse({"ok": True})
+
+                data_json = txn["data"].get("data", {})
+                transaction_id = str(data_json.get("id") or "")
+                checkout_url = ((data_json.get("checkout") or {}).get("url") or "").strip()
+                order_id = txn["order_id"]
+
+                if not transaction_id or not checkout_url:
+                    tg_send_message(chat_id, f"Paddle response is missing transaction id or checkout url:\n{txn['data']}")
+                    tg_answer_callback(cq_id)
+                    return JSONResponse({"ok": True})
+
+                with SessionLocal() as db:
+                    try:
+                        p = Payment(
+                            telegram_id=int(chat_id),
+                            order_id=order_id,
+                            invoice_id=transaction_id,
+                            external_id=transaction_id,
+                            package_code=package_code,
+                            amount_usd=int(PACKAGES[package_code]["usd"]),
+                            provider="paddle",
+                            status="created",
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow(),
+                        )
+                        db.add(p)
+                        db.commit()
+                    except IntegrityError as e:
+                        db.rollback()
+                        log.warning(f"Paddle payment insert IntegrityError: {e}")
+                    except Exception as e:
+                        db.rollback()
+                        tg_send_message(chat_id, f"DB error: {e}")
+                        tg_answer_callback(cq_id)
+                        return JSONResponse({"ok": True})
+
+                kb = {
+                    "inline_keyboard": [
+                        [{"text": "Pay with card 💳", "url": checkout_url}],
+                    ]
+                }
+                tg_send_message(
+                    chat_id,
+                    f"✅ Card checkout created.\nAmount: ${PACKAGES[package_code]['usd']}\nPackage: {package_code}",
+                    reply_markup=kb
+                )
+                tg_answer_callback(cq_id)
+                return JSONResponse({"ok": True})
+
             if data == "buy:menu":
                 tg_send_message(chat_id, "💳 Choose a minutes package:", reply_markup=build_packages_keyboard())
                 tg_answer_callback(cq_id)
@@ -1328,6 +1565,8 @@ async def telegram_webhook(req: Request):
                             invoice_id=str(invoice_id),
                             package_code=package_code,
                             amount_usd=int(amount_usd),
+                            provider="nowpayments",
+                            external_id=str(invoice_id),
                             status="created",
                             created_at=datetime.utcnow(),
                             updated_at=datetime.utcnow(),
@@ -1394,9 +1633,15 @@ async def nowpayments_postback(req: Request):
         with SessionLocal() as db:
             p = None
             if order_id:
-                p = db.query(Payment).filter(Payment.order_id == str(order_id)).first()
+                p = db.query(Payment).filter(
+                    Payment.provider == "nowpayments",
+                    Payment.order_id == str(order_id)
+                ).first()
             if not p and payment_id:
-                p = db.query(Payment).filter(Payment.invoice_id == str(payment_id)).first()
+                p = db.query(Payment).filter(
+                    Payment.provider == "nowpayments",
+                    Payment.invoice_id == str(payment_id)
+                ).first()
 
             if not p:
                 log.warning(f"Payment not found for order_id={order_id}, payment_id={payment_id}")
@@ -1414,37 +1659,97 @@ async def nowpayments_postback(req: Request):
             if payment_status not in paid_statuses:
                 return PlainTextResponse("ok", status_code=200)
 
-            pkg = PACKAGES.get(p.package_code)
-            if not pkg:
-                return PlainTextResponse("ok", status_code=200)
-
-            add_seconds = int(pkg["minutes"] * 60)
-
-            user = ensure_user(db, int(p.telegram_id))
-
-            user.balance_seconds = max(0, int(user.balance_seconds or 0) + add_seconds)
-            user.updated_at = datetime.utcnow()
-
-            p.status = "paid"
-            p.updated_at = datetime.utcnow()
-
-            db.add(user)
-            db.add(p)
-            db.commit()
-            db.refresh(user)
-
-            bal_min = max(0, int(user.balance_seconds or 0)) // 60
-            tg_send_message(
-                int(user.telegram_id),
-                f"✅ Payment received!\nPackage: {p.package_code}\nCredited: {pkg['minutes']} min\nBalance: {bal_min} min",
-                reply_markup=user_keyboard(user),
-            )
+            credit_payment_if_needed(db, p)
 
         return PlainTextResponse("ok", status_code=200)
 
     except Exception as e:
         log.exception("NOWPayments postback error")
         return PlainTextResponse(f"error: {e}", status_code=200)
+
+
+@app.post(PADDLE_POSTBACK_PATH)
+async def paddle_postback(req: Request):
+    raw = await req.body()
+    signature = req.headers.get("Paddle-Signature", "")
+
+    if not verify_paddle_signature(raw, signature):
+        log.warning("Invalid Paddle signature")
+        return PlainTextResponse("invalid signature", status_code=400)
+
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return PlainTextResponse("bad json", status_code=400)
+
+    try:
+        event_type = str(payload.get("event_type") or "").strip().lower()
+        if event_type != "transaction.completed":
+            return PlainTextResponse("ok", status_code=200)
+
+        data = payload.get("data") or {}
+        transaction_id = str(data.get("id") or "").strip()
+        custom_data = data.get("custom_data") or {}
+        order_id = str(custom_data.get("order_id") or "").strip()
+        package_code = str(custom_data.get("package_code") or "").strip()
+        telegram_id = str(custom_data.get("telegram_id") or "").strip()
+
+        with SessionLocal() as db:
+            p = None
+            if transaction_id:
+                p = db.query(Payment).filter(
+                    Payment.provider == "paddle",
+                    Payment.invoice_id == transaction_id
+                ).first()
+
+            if not p and order_id:
+                p = db.query(Payment).filter(
+                    Payment.provider == "paddle",
+                    Payment.order_id == order_id
+                ).first()
+
+            if not p:
+                if not transaction_id or not telegram_id or not package_code:
+                    log.warning(f"Paddle payment not found and insufficient custom data: txn={transaction_id}, order={order_id}")
+                    return PlainTextResponse("ok", status_code=200)
+
+                p = Payment(
+                    telegram_id=int(telegram_id),
+                    order_id=order_id or f"pdl_{telegram_id}_{package_code}_{int(time.time())}",
+                    invoice_id=transaction_id,
+                    external_id=transaction_id,
+                    package_code=package_code,
+                    amount_usd=int(PACKAGES.get(package_code, {}).get("usd") or 0),
+                    provider="paddle",
+                    status="created",
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                )
+                db.add(p)
+                try:
+                    db.commit()
+                except IntegrityError:
+                    db.rollback()
+                    p = db.query(Payment).filter(
+                        Payment.provider == "paddle",
+                        Payment.invoice_id == transaction_id
+                    ).first()
+
+            if not p:
+                return PlainTextResponse("ok", status_code=200)
+
+            p.external_id = transaction_id or p.external_id
+            p.updated_at = datetime.utcnow()
+            db.add(p)
+            db.commit()
+
+            credit_payment_if_needed(db, p)
+
+        return PlainTextResponse("ok", status_code=200)
+
+    except Exception as e:
+        log.exception("Paddle postback error")
+        return PlainTextResponse(f"error: {e}", status_code=500)
 
 
 @app.get("/terms", response_class=HTMLResponse)
