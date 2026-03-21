@@ -1019,10 +1019,26 @@ def paddle_pay_page(request: Request):
 </head>
 <body style="font-family:Arial, sans-serif; padding:40px;">
   <h2>Lingovox payment</h2>
-  <p>Opening secure checkout...</p>
+  <p id="status">Opening secure checkout...</p>
 
   <script>
-    document.addEventListener("DOMContentLoaded", function () {{
+    (function () {{
+      const statusEl = document.getElementById("status");
+
+      function setStatus(msg, isError) {{
+        statusEl.textContent = msg;
+        statusEl.style.color = isError ? "#b00020" : "#111";
+      }}
+
+      window.addEventListener("error", function (e) {{
+        setStatus("JavaScript error: " + (e.message || "unknown error"), true);
+      }});
+
+      window.addEventListener("unhandledrejection", function (e) {{
+        const msg = e && e.reason && e.reason.message ? e.reason.message : String(e.reason || "unknown promise error");
+        setStatus("Promise error: " + msg, true);
+      }});
+
       try {{
         if ("{env_name}" === "sandbox") {{
           Paddle.Environment.set("sandbox");
@@ -1031,23 +1047,26 @@ def paddle_pay_page(request: Request):
         Paddle.Initialize({{
           token: "{PADDLE_CLIENT_TOKEN}",
           eventCallback: function (event) {{
+            console.log("Paddle event:", event);
+
             if (event && event.name === "checkout.completed") {{
               window.location.href = "{success_url}";
+            }}
+
+            if (event && event.name === "checkout.closed") {{
+              setStatus("Checkout closed.");
             }}
           }}
         }});
 
-        Paddle.Checkout.open({{
-          transactionId: "{txn_id}"
-        }});
+        // Не вызываем Paddle.Checkout.open().
+        // Для default payment link с ?_ptxn=... Paddle.js должен открыть checkout сам.
+        setStatus("Opening secure checkout...");
       }} catch (err) {{
-        document.body.insertAdjacentHTML(
-          "beforeend",
-          "<p style=\"color:#b00020; margin-top:16px;\">Checkout failed to open. Please try again later.</p>"
-        );
         console.error(err);
+        setStatus("Checkout failed to initialize: " + (err && err.message ? err.message : String(err)), true);
       }}
-    }});
+    }})();
   </script>
 </body>
 </html>"""
