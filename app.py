@@ -1243,7 +1243,7 @@ async def telegram_webhook(req: Request):
                             source_lang = normalize_lang_code(user.conversation_source_lang or "")
                             target_lang = normalize_lang_code(user.conversation_target_lang or "")
 
-                            setup = conversation_setup_from_voice(original_text)
+                            setup = parse_conversation_setup(original_text)
                             has_new_setup = bool(setup.get("has_setup_command") and setup.get("target_lang") and setup.get("message_text"))
 
                             # Conversation mode is fully independent from the main menu language.
