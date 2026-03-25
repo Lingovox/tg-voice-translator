@@ -303,20 +303,96 @@ def parse_conversation_setup(text: str) -> Dict[str, str]:
     }
 
 
-def decide_conversation_target_any(source_lang: str, target_lang: str, incoming_lang: str) -> Tuple[str, str]:
-    src = normalize_language_name(source_lang)
-    tgt = normalize_language_name(target_lang)
-    inc = normalize_language_name(incoming_lang)
+
+
+_LANGUAGE_CANON_CACHE: Dict[str, str] = {}
+
+
+def canonicalize_language_name(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    key = normalize_language_name(raw)
+    cached = _LANGUAGE_CANON_CACHE.get(key)
+    if cached:
+        return cached
+
+    url = "https://api.openai.com/v1/responses"
+    headers = _openai_headers()
+    headers["Content-Type"] = "application/json"
+    prompt = (
+        "Normalize the following language reference to a canonical plain English language name. "
+        "Examples: 'таджикский' -> 'Tajik', 'Тоҷикӣ' -> 'Tajik', 'русский' -> 'Russian', 'espanol' -> 'Spanish'. "
+        "Return only JSON like {\"language\":\"Tajik\"}.\n\n"
+        f"Language reference:\n{raw}"
+    )
+    payload = {"model": OPENAI_TEXT_MODEL, "input": prompt}
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI language normalization failed: HTTP {r.status_code}: {r.text}")
+    out = _extract_output_text(r.json())
+    try:
+        parsed = json.loads(out)
+    except Exception:
+        parsed = {}
+    language = str(parsed.get("language") or "").strip()
+    if not language:
+        language = raw
+    _LANGUAGE_CANON_CACHE[key] = language
+    return language
+
+
+def choose_language_in_pair(source_lang: str, target_lang: str, incoming_lang: str) -> str:
+    source_canonical = canonicalize_language_name(source_lang)
+    target_canonical = canonicalize_language_name(target_lang)
+    incoming_canonical = canonicalize_language_name(incoming_lang)
+
+    src = normalize_language_name(source_canonical)
+    tgt = normalize_language_name(target_canonical)
+    inc = normalize_language_name(incoming_canonical)
 
     if inc == src:
-        return target_lang, source_lang
+        return source_canonical
     if inc == tgt:
-        return source_lang, target_lang
+        return target_canonical
 
-    raise RuntimeError(
-        f"Detected language '{incoming_lang}' is outside this conversation: "
-        f"{source_lang} ↔ {target_lang}"
+    url = "https://api.openai.com/v1/responses"
+    headers = _openai_headers()
+    headers["Content-Type"] = "application/json"
+    prompt = (
+        "You are matching a detected language to one side of an active two-language conversation. "
+        "Return only JSON like {\"match\":\"source\"} or {\"match\":\"target\"} or {\"match\":\"unknown\"}.\n\n"
+        f"Source language: {source_canonical}\n"
+        f"Target language: {target_canonical}\n"
+        f"Detected incoming language: {incoming_canonical}\n"
     )
+    payload = {"model": OPENAI_TEXT_MODEL, "input": prompt}
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"OpenAI conversation match failed: HTTP {r.status_code}: {r.text}")
+    out = _extract_output_text(r.json())
+    try:
+        parsed = json.loads(out)
+    except Exception:
+        parsed = {}
+    match = str(parsed.get("match") or "").strip().lower()
+    if match == "source":
+        return source_canonical
+    if match == "target":
+        return target_canonical
+    raise RuntimeError(
+        f"Detected language '{incoming_canonical}' is outside this conversation: "
+        f"{source_canonical} ↔ {target_canonical}"
+    )
+
+
+def decide_conversation_target_any(source_lang: str, target_lang: str, incoming_lang: str) -> Tuple[str, str]:
+    source_canonical = canonicalize_language_name(source_lang)
+    target_canonical = canonicalize_language_name(target_lang)
+    matched_side = choose_language_in_pair(source_canonical, target_canonical, incoming_lang)
+    if normalize_language_name(matched_side) == normalize_language_name(source_canonical):
+        return target_canonical, source_canonical
+    return source_canonical, target_canonical
 
 
 def lang_name(code: str) -> str:
@@ -782,6 +858,7 @@ def detect_language_from_text(text: str) -> str:
     return language
 
 
+
 def parse_conversation_setup(text: str) -> Dict[str, str]:
     local = parse_conversation_setup_local(text)
     if local.get("target_lang") and local.get("message_text") and local.get("has_setup_command"):
@@ -790,15 +867,14 @@ def parse_conversation_setup(text: str) -> Dict[str, str]:
     url = "https://api.openai.com/v1/responses"
     headers = _openai_headers()
     headers["Content-Type"] = "application/json"
-    examples = ", ".join([f"{name}={code}" for name, code in LANGS])
     prompt = (
         "Extract conversation setup from the user's first phrase for a voice translation bot. "
-        "The user may say things like 'translate to Spanish: hello', 'переведи на испанский: привет', "
-        "'auf spanisch übersetze: hallo'. "
+        "The user may say things like 'translate to Spanish: hello', 'переведи на таджикский язык. привет', "
+        "or similar phrases in any language. "
         "Return only JSON with keys target_lang, message_text, has_setup_command. "
-        f"Use only supported language codes from this list: {examples}. "
-        "Return target_lang only as a language code like es, ru, en, de, fr, tr, zh, ar, th, vi. "
-        "If the target language is unclear, return target_lang as empty string. "
+        "target_lang must be a plain English language name like Spanish, Tajik, Uzbek, Kazakh, Arabic, Japanese, etc. "
+        "Do not return a language code. "
+        "If the target language is unclear, return target_lang as an empty string. "
         "message_text must contain only the part that should actually be translated, without the command.\n\n"
         f"Text:\n{text}"
     )
@@ -811,17 +887,15 @@ def parse_conversation_setup(text: str) -> Dict[str, str]:
         parsed = json.loads(out)
     except Exception:
         parsed = {}
-    target_lang = str(parsed.get("target_lang") or "").strip().lower()
+    target_lang = str(parsed.get("target_lang") or "").strip()
     message_text = str(parsed.get("message_text") or "").strip()
     has_setup_command = bool(parsed.get("has_setup_command"))
-    if target_lang and target_lang not in SUPPORTED_LANG_CODES:
-        target_lang = find_language_code_in_text(target_lang)
     if not target_lang:
         target_lang = local.get("target_lang", "")
     if not message_text:
         message_text = local.get("message_text", "")
     return {
-        "target_lang": target_lang if target_lang in SUPPORTED_LANG_CODES else "",
+        "target_lang": target_lang,
         "message_text": message_text,
         "has_setup_command": has_setup_command or bool(local.get("has_setup_command")),
     }
@@ -1310,7 +1384,7 @@ async def telegram_webhook(req: Request):
 
                             setup = parse_conversation_setup(original_text)
                             if setup.get("has_setup_command") and setup.get("target_lang") and setup.get("message_text"):
-                                target_lang = setup.get("target_lang", "").strip()
+                                target_lang = canonicalize_language_name(setup.get("target_lang", "").strip())
                                 source_text = setup.get("message_text", "").strip()
 
                                 if not target_lang:
@@ -1322,7 +1396,7 @@ async def telegram_webhook(req: Request):
                                         "I understood the target language, but there is no phrase to translate after the command."
                                     )
 
-                                source_lang = detect_language_name_from_text(source_text)
+                                source_lang = canonicalize_language_name(detect_language_name_from_text(source_text))
                                 if normalize_language_name(source_lang) == normalize_language_name(target_lang):
                                     raise RuntimeError(
                                         "Source and target languages are the same. Please choose another target language."
@@ -1346,7 +1420,7 @@ async def telegram_webhook(req: Request):
                                         "Conversation is not configured. Start with a phrase like: 'Translate to Spanish: hello, how are you?'"
                                     )
 
-                                incoming_lang = detect_language_name_from_text(original_text)
+                                incoming_lang = canonicalize_language_name(detect_language_name_from_text(original_text))
                                 translate_to, resolved_incoming_lang = decide_conversation_target_any(
                                     source_lang,
                                     target_lang,
