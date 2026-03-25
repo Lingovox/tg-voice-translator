@@ -106,6 +106,21 @@ LANGS = [
 LANG_LABELS = {code: name for name, code in LANGS}
 SUPPORTED_LANG_CODES = {code for _, code in LANGS}
 
+ENGLISH_NAME_BY_CODE = {
+    "en": "English",
+    "ru": "Russian",
+    "de": "German",
+    "es": "Spanish",
+    "th": "Thai",
+    "vi": "Vietnamese",
+    "fr": "French",
+    "tr": "Turkish",
+    "zh": "Chinese",
+    "ar": "Arabic",
+    "uz": "Uzbek",
+    "kk": "Kazakh",
+}
+
 LANG_ALIASES = {
     "en": ["english", "английский", "английском", "английскую", "ingliz", "инглиш"],
     "ru": ["russian", "русский", "русском", "русскую", "russkiy", "рус"],
@@ -143,6 +158,59 @@ def normalize_lang_code(value: str) -> str:
     return find_language_code_in_text(raw)
 
 
+def english_lang_name_from_code(code: str) -> str:
+    return ENGLISH_NAME_BY_CODE.get((code or "").strip().lower(), "")
+
+
+def normalize_conversation_lang(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+
+    code = normalize_lang_code(raw)
+    if code:
+        return english_lang_name_from_code(code) or raw.title()
+
+    low = raw.lower()
+    for code, aliases in LANG_ALIASES.items():
+        if low == code or low in aliases:
+            return english_lang_name_from_code(code) or raw.title()
+
+    cleaned = re.sub(r"(language|язык|тілі|tili)", "", raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.:;!-—–")
+    return cleaned.title() if cleaned else raw.title()
+
+
+def detect_language_name_from_text(text: str, fallback_code: str = "") -> str:
+    fallback_name = english_lang_name_from_code(normalize_lang_code(fallback_code))
+
+    url = "https://api.openai.com/v1/responses"
+    headers = _openai_headers()
+    headers["Content-Type"] = "application/json"
+    prompt = (
+        "Detect the language of the text. Return only JSON like "
+        '{"language":"Russian"}'
+        " using a plain English language name, not a code.
+
+Text:
+"
+        + text
+    )
+    payload = {"model": OPENAI_TEXT_MODEL, "input": prompt}
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    if r.status_code == 200:
+        out = _extract_output_text(r.json())
+        try:
+            parsed = json.loads(out)
+        except Exception:
+            parsed = {}
+        language = normalize_conversation_lang(str(parsed.get("language") or ""))
+        if language:
+            return language
+
+    return fallback_name or ""
+
+
 def resolve_source_language(text: str, detected_lang: str, telegram_lang: str, prefer_text: bool = False) -> str:
     detected = normalize_lang_code(detected_lang)
 
@@ -167,10 +235,25 @@ def resolve_source_language(text: str, detected_lang: str, telegram_lang: str, p
 
 
 def decide_conversation_target(source_lang: str, target_lang: str, incoming_lang: str, telegram_lang: str) -> Tuple[str, str]:
-    source_lang = normalize_lang_code(source_lang)
-    target_lang = normalize_lang_code(target_lang)
-    incoming_lang = normalize_lang_code(incoming_lang)
-    telegram_lang = normalize_lang_code(telegram_lang)
+    source_lang = normalize_conversation_lang(source_lang)
+    target_lang = normalize_conversation_lang(target_lang)
+    incoming_lang = normalize_conversation_lang(incoming_lang)
+    telegram_lang = english_lang_name_from_code(normalize_lang_code(telegram_lang))
+
+    if incoming_lang == source_lang:
+        return target_lang, incoming_lang
+    if incoming_lang == target_lang:
+        return source_lang, incoming_lang
+
+    if telegram_lang == source_lang:
+        return target_lang, source_lang
+    if telegram_lang == target_lang:
+        return source_lang, target_lang
+
+    raise RuntimeError(
+        f"Could not determine translation direction for conversation: "
+        f"{source_lang or 'unknown'} ↔ {target_lang or 'unknown'}"
+    )
 
     if incoming_lang == source_lang:
         return target_lang, incoming_lang
@@ -206,55 +289,42 @@ def decide_conversation_target(source_lang: str, target_lang: str, incoming_lang
 def parse_conversation_setup_local(text: str) -> Dict[str, str]:
     original = (text or "").strip()
     low = original.lower()
-    target_lang = find_language_code_in_text(low)
+
+    patterns = [
+        r"^\s*переведи\s+на\s+(.+?)[,:;.!?\-]+\s*(.+)$",
+        r"^\s*перевести\s+на\s+(.+?)[,:;.!?\-]+\s*(.+)$",
+        r"^\s*translate\s+(?:to|into)\s+(.+?)[,:;.!?\-]+\s*(.+)$",
+        r"^\s*übersetze\s+(?:auf|ins?)\s+(.+?)[,:;.!?\-]+\s*(.+)$",
+    ]
+
+    for pattern in patterns:
+        m = re.match(pattern, original, flags=re.IGNORECASE)
+        if m:
+            target_lang_raw = m.group(1).strip()
+            message_text = m.group(2).strip()
+            return {
+                "target_lang": normalize_conversation_lang(target_lang_raw),
+                "message_text": message_text,
+                "has_setup_command": True,
+            }
 
     has_setup_command = any(cmd in low for cmd in [
         "translate to", "translate into", "переведи на", "перевести на",
         "übersetze auf", "übersetze ins", "translate", "переведи", "перевести"
     ])
 
-    message_text = original
-    if has_setup_command and target_lang:
-        patterns = [
-            r"^\s*переведи\s+на\s+[^,:;.!?]+[,:;.!?\-]*\s*(.+)$",
-            r"^\s*перевести\s+на\s+[^,:;.!?]+[,:;.!?\-]*\s*(.+)$",
-            r"^\s*translate\s+(?:to|into)\s+[^,:;.!?]+[,:;.!?\-]*\s*(.+)$",
-            r"^\s*übersetze\s+(?:auf|ins?)\s+[^,:;.!?]+[,:;.!?\-]*\s*(.+)$",
-        ]
-        for pattern in patterns:
-            m = re.match(pattern, original, flags=re.IGNORECASE)
-            if m:
-                message_text = m.group(1).strip()
-                break
-        if message_text == original:
-            for sep in [":", ",", " — ", " - ", " – ", ";"]:
-                if sep in original:
-                    left, right = original.split(sep, 1)
-                    if find_language_code_in_text(left.lower()):
-                        message_text = right.strip()
-                        break
-
-    if message_text == original and has_setup_command and target_lang:
-        alias_cut = None
-        for alias in LANG_ALIASES.get(target_lang, []):
-            idx = low.find(alias)
-            if idx != -1:
-                alias_cut = idx + len(alias)
-                break
-        if alias_cut is not None:
-            tail = original[alias_cut:].lstrip(" ,:;.-—–")
-            if tail:
-                message_text = tail
-
     return {
-        "target_lang": target_lang,
-        "message_text": (message_text or "").strip(),
+        "target_lang": "",
+        "message_text": original,
         "has_setup_command": has_setup_command,
     }
 
 
 def lang_name(code: str) -> str:
-    return LANG_LABELS.get((code or "").strip().lower(), (code or "").strip().lower() or "unknown")
+    norm = normalize_lang_code(code)
+    if norm:
+        return ENGLISH_NAME_BY_CODE.get(norm, code)
+    return normalize_conversation_lang(code) or "unknown"
 
 
 # ============================
@@ -724,17 +794,18 @@ def parse_conversation_setup(text: str) -> Dict[str, str]:
     url = "https://api.openai.com/v1/responses"
     headers = _openai_headers()
     headers["Content-Type"] = "application/json"
-    examples = ", ".join([f"{name}={code}" for name, code in LANGS])
     prompt = (
-        "Extract conversation setup from the user's first phrase for a voice translation bot. "
+        "Extract conversation setup from the user's phrase for a voice translation bot. "
         "The user may say things like 'translate to Spanish: hello', 'переведи на испанский: привет', "
-        "'auf spanisch übersetze: hallo'. "
+        "or use any other target language. "
         "Return only JSON with keys target_lang, message_text, has_setup_command. "
-        f"Use only supported language codes from this list: {examples}. "
-        "Return target_lang only as a language code like es, ru, en, de, fr, tr, zh, ar, th, vi, uz, kk. "
+        "target_lang must be a plain English language name like Spanish, Uzbek, Kazakh, Portuguese, Hindi. "
         "If the target language is unclear, return target_lang as empty string. "
-        "message_text must contain only the part that should actually be translated, without the command.\n\n"
-        f"Text:\n{text}"
+        "message_text must contain only the part that should actually be translated, without the command.
+
+"
+        f"Text:
+{text}"
     )
     payload = {"model": OPENAI_TEXT_MODEL, "input": prompt}
     r = requests.post(url, headers=headers, json=payload, timeout=60)
@@ -745,17 +816,18 @@ def parse_conversation_setup(text: str) -> Dict[str, str]:
         parsed = json.loads(out)
     except Exception:
         parsed = {}
-    target_lang = str(parsed.get("target_lang") or "").strip().lower()
+
+    target_lang = normalize_conversation_lang(str(parsed.get("target_lang") or ""))
     message_text = str(parsed.get("message_text") or "").strip()
     has_setup_command = bool(parsed.get("has_setup_command"))
-    if target_lang and target_lang not in SUPPORTED_LANG_CODES:
-        target_lang = find_language_code_in_text(target_lang)
+
     if not target_lang:
-        target_lang = local.get("target_lang", "")
+        target_lang = normalize_conversation_lang(local.get("target_lang", ""))
     if not message_text:
         message_text = local.get("message_text", "")
+
     return {
-        "target_lang": target_lang if target_lang in SUPPORTED_LANG_CODES else "",
+        "target_lang": target_lang,
         "message_text": message_text,
         "has_setup_command": has_setup_command or bool(local.get("has_setup_command")),
     }
@@ -1239,17 +1311,19 @@ async def telegram_webhook(req: Request):
                     if user_mode == "conversation":
                         with SessionLocal() as db:
                             user = ensure_user(db, int(chat_id))
-                            source_lang = normalize_lang_code(user.conversation_source_lang or "")
-                            target_lang = normalize_lang_code(user.conversation_target_lang or "")
+                            source_lang = normalize_conversation_lang(user.conversation_source_lang or "")
+                            target_lang = normalize_conversation_lang(user.conversation_target_lang or "")
 
-                            if not source_lang or not target_lang:
-                                setup = parse_conversation_setup(original_text)
-                                target_lang = normalize_lang_code(setup.get("target_lang", ""))
+                            setup = parse_conversation_setup(original_text)
+                            reconfigure = bool(setup.get("has_setup_command") and setup.get("target_lang") and setup.get("message_text"))
+
+                            if not source_lang or not target_lang or reconfigure:
+                                target_lang = normalize_conversation_lang(setup.get("target_lang", ""))
                                 message_text = setup.get("message_text", "").strip()
 
                                 if not target_lang:
                                     raise RuntimeError(
-                                        "Conversation is not configured. Say: 'Translate to Spanish: hello, how are you?'"
+                                        "Conversation is not configured. Say something like: 'Translate to Spanish: hello, how are you?'"
                                     )
                                 if not message_text:
                                     raise RuntimeError(
@@ -1257,11 +1331,9 @@ async def telegram_webhook(req: Request):
                                     )
 
                                 source_text = message_text
-                                source_lang = resolve_source_language(
+                                source_lang = detect_language_name_from_text(
                                     source_text,
-                                    detected_lang,
-                                    telegram_lang,
-                                    prefer_text=True
+                                    fallback_code=detected_lang or telegram_lang,
                                 )
                                 if not source_lang:
                                     raise RuntimeError(
@@ -1269,14 +1341,12 @@ async def telegram_webhook(req: Request):
                                     )
 
                                 if source_lang == target_lang:
-                                    fallback_source_lang = resolve_source_language(
+                                    fallback_source_lang = detect_language_name_from_text(
                                         source_text,
-                                        "",
-                                        telegram_lang,
-                                        prefer_text=True
+                                        fallback_code=telegram_lang,
                                     )
-                                    if fallback_source_lang and fallback_source_lang != target_lang:
-                                        source_lang = fallback_source_lang
+                                    if fallback_source_lang and normalize_conversation_lang(fallback_source_lang) != normalize_conversation_lang(target_lang):
+                                        source_lang = normalize_conversation_lang(fallback_source_lang)
 
                                 if source_lang == target_lang:
                                     raise RuntimeError(
@@ -1296,11 +1366,9 @@ async def telegram_webhook(req: Request):
                                     source_lang=source_lang
                                 )
                             else:
-                                incoming_lang = resolve_source_language(
+                                incoming_lang = detect_language_name_from_text(
                                     original_text,
-                                    detected_lang,
-                                    "",
-                                    prefer_text=True
+                                    fallback_code=detected_lang or telegram_lang,
                                 )
 
                                 translate_to, resolved_incoming_lang = decide_conversation_target(
