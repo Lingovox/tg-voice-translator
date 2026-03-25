@@ -413,7 +413,7 @@ def format_status_text(user: User) -> str:
         else:
             conversation_line = (
                 "🗣 Conversation mode is on\n"
-                "First voice can sound like: 'Translate to Spanish: hello, how are you?'\n"
+                "Start with a phrase like: 'Translate to Spanish: hello, how are you?'\n"
             )
 
         return (
@@ -421,7 +421,7 @@ def format_status_text(user: User) -> str:
             f"{conversation_line}"
             f"🎁 Free messages left: {user.trial_left} (≤ {TRIAL_MAX_SECONDS}s)\n"
             f"💳 Balance: {bal_min} min\n\n"
-            "Bot will remember both languages after the first setup phrase."
+            "Conversation mode ignores the main menu language and remembers only the spoken pair."
         )
 
     return (
@@ -1243,24 +1243,17 @@ async def telegram_webhook(req: Request):
                             source_lang = normalize_lang_code(user.conversation_source_lang or "")
                             target_lang = normalize_lang_code(user.conversation_target_lang or "")
 
-                            if not source_lang or not target_lang:
-                                setup = parse_conversation_setup(original_text)
-                                target_lang = normalize_lang_code(setup.get("target_lang", ""))
-                                message_text = setup.get("message_text", "").strip()
+                            setup = conversation_setup_from_voice(original_text)
+                            has_new_setup = bool(setup.get("has_setup_command") and setup.get("target_lang") and setup.get("message_text"))
 
-                                if not target_lang:
-                                    raise RuntimeError(
-                                        "Conversation is not configured. Say something like: 'Translate to Spanish: hello, how are you?'"
-                                    )
-                                if not message_text:
-                                    raise RuntimeError(
-                                        "I understood the target language, but there is no phrase to translate after the command."
-                                    )
-
-                                source_text = message_text
+                            # Conversation mode is fully independent from the main menu language.
+                            # New spoken setup commands always reconfigure the language pair.
+                            if has_new_setup:
+                                target_lang = setup["target_lang"]
+                                source_text = setup["message_text"]
                                 source_lang = resolve_source_language(
                                     source_text,
-                                    detected_lang,
+                                    "",
                                     telegram_lang,
                                     prefer_text=True
                                 )
@@ -1268,17 +1261,6 @@ async def telegram_webhook(req: Request):
                                     raise RuntimeError(
                                         "Could not determine the source language for conversation setup."
                                     )
-
-                                if source_lang == target_lang:
-                                    fallback_source_lang = resolve_source_language(
-                                        source_text,
-                                        "",
-                                        telegram_lang,
-                                        prefer_text=True
-                                    )
-                                    if fallback_source_lang and fallback_source_lang != target_lang:
-                                        source_lang = fallback_source_lang
-
                                 if source_lang == target_lang:
                                     raise RuntimeError(
                                         "Source and target languages are the same. Please choose another target language."
@@ -1297,10 +1279,15 @@ async def telegram_webhook(req: Request):
                                     source_lang=source_lang
                                 )
                             else:
+                                if not source_lang or not target_lang:
+                                    raise RuntimeError(
+                                        "Conversation is not configured. Start with a phrase like: 'Translate to Spanish: hello, how are you?'"
+                                    )
+
                                 incoming_lang = resolve_source_language(
                                     original_text,
                                     detected_lang,
-                                    "",
+                                    telegram_lang,
                                     prefer_text=True
                                 )
 
@@ -1404,7 +1391,7 @@ async def telegram_webhook(req: Request):
                         "Start with a phrase like:\n"
                         "'Translate to Spanish: hello, how are you?'\n"
                         "or 'Переведи на узбекский язык. Здравствуйте, как ваши дела?'\n\n"
-                        "After the first phrase, the bot will remember both languages.",
+                        "The bot will ignore the main menu language and remember only the spoken pair.",
                         reply_markup=user_keyboard(user),
                     )
 
