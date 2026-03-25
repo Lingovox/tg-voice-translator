@@ -1195,7 +1195,6 @@ async def telegram_webhook(req: Request):
 
                 with SessionLocal() as db:
                     user = ensure_user(db, int(chat_id))
-
                     bill_mode, seconds_to_charge = decide_billing(user, duration)
                     if bill_mode == "deny":
                         kb = user_keyboard(user)
@@ -1206,7 +1205,7 @@ async def telegram_webhook(req: Request):
                             f"Your balance: {bal_min} min\n"
                             f"Free messages left: {user.trial_left}\n\n"
                             "Tap “Buy minutes” to top up.",
-                            reply_markup=kb
+                            reply_markup=kb,
                         )
                         return JSONResponse({"ok": True})
 
@@ -1257,7 +1256,7 @@ async def telegram_webhook(req: Request):
                                     source_text,
                                     detected_lang,
                                     telegram_lang,
-                                    prefer_text=True
+                                    prefer_text=True,
                                 )
                                 if not source_lang:
                                     raise RuntimeError(
@@ -1269,7 +1268,7 @@ async def telegram_webhook(req: Request):
                                         source_text,
                                         "",
                                         telegram_lang,
-                                        prefer_text=True
+                                        prefer_text=True,
                                     )
                                     if fallback_source_lang and fallback_source_lang != target_lang:
                                         source_lang = fallback_source_lang
@@ -1289,27 +1288,27 @@ async def telegram_webhook(req: Request):
                                 translated_text = openai_translate_text(
                                     source_text,
                                     target_lang,
-                                    source_lang=source_lang
+                                    source_lang=source_lang,
                                 )
                             else:
                                 incoming_lang = resolve_source_language(
                                     original_text,
                                     detected_lang,
                                     "",
-                                    prefer_text=True
+                                    prefer_text=True,
                                 )
 
                                 translate_to, resolved_incoming_lang = decide_conversation_target(
                                     source_lang,
                                     target_lang,
                                     incoming_lang,
-                                    telegram_lang
+                                    telegram_lang,
                                 )
 
                                 translated_text = openai_translate_text(
                                     original_text,
                                     translate_to,
-                                    source_lang=resolved_incoming_lang or None
+                                    source_lang=resolved_incoming_lang or None,
                                 )
 
                         tts_audio = openai_tts(translated_text)
@@ -1349,81 +1348,6 @@ async def telegram_webhook(req: Request):
                 tg_send_voice(chat_id, tts_audio, caption=caption)
                 tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
                 return JSONResponse({"ok": True})
-
-                with SessionLocal() as db:
-                    user = ensure_user(db, int(chat_id))
-
-                    mode, seconds_to_charge = decide_billing(user, duration)
-                    if mode == "deny":
-                        kb = user_keyboard(user)
-                        bal_min = max(0, int(user.balance_seconds or 0)) // 60
-                        tg_send_message(
-                            chat_id,
-                            "⛔ Not enough balance.\n\n"
-                            f"Your balance: {bal_min} min\n"
-                            f"Free messages left: {user.trial_left}\n\n"
-                            "Tap “Buy minutes” to top up.",
-                            reply_markup=kb
-                        )
-                        return JSONResponse({"ok": True})
-
-                gf = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30).json()
-                if not gf.get("ok"):
-                    tg_send_message(chat_id, f"Failed to get file: {gf}")
-                    return JSONResponse({"ok": True})
-
-                file_path = gf["result"]["file_path"]
-                file_url = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{file_path}"
-                audio = requests.get(file_url, timeout=60).content
-
-                try:
-                    with SessionLocal() as db:
-                        user = db.get(User, int(chat_id))
-                        if not user:
-                            user = User(
-                                telegram_id=int(chat_id),
-                                target_lang="en",
-                                trial_left=TRIAL_LIMIT,
-                                trial_messages=0,
-                                balance_seconds=0,
-                            )
-                            db.add(user)
-                            db.commit()
-                            db.refresh(user)
-                        target_lang = user.target_lang
-
-                    original_text = openai_transcribe(audio)
-                    translated_text = openai_translate_text(original_text, target_lang)
-                    tts_audio = openai_tts(translated_text)
-                except Exception as e:
-                    log.exception("Voice pipeline error")
-                    tg_send_message(chat_id, f"⚠️ Error while processing voice: {e}")
-                    return JSONResponse({"ok": True})
-
-                with SessionLocal() as db:
-                    user = ensure_user(db, int(chat_id))
-
-                    mode, seconds_to_charge = decide_billing(user, duration)
-                    if mode == "deny":
-                        kb = user_keyboard(user)
-                        tg_send_message(chat_id, "⛔ Not enough balance (re-check).", reply_markup=kb)
-                        return JSONResponse({"ok": True})
-
-                    apply_billing(db, user, mode, seconds_to_charge)
-                    db.commit()
-                    db.refresh(user)
-
-                    kb = user_keyboard(user)
-                    caption = None
-                    if mode == "trial":
-                        caption = f"🎁 Trial message used. Free left: {user.trial_left}"
-                    elif mode == "paid":
-                        caption = f"💳 Charged: {seconds_to_charge}s. Balance: {max(0, int(user.balance_seconds)) // 60} min"
-
-                tg_send_voice(chat_id, tts_audio, caption=caption)
-                tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
-                return JSONResponse({"ok": True})
-
             return JSONResponse({"ok": True})
 
         if "callback_query" in update:
