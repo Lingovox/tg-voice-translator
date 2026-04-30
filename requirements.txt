@@ -7,3 +7,4 @@ psycopg2-binary==2.9.9
 python-dotenv==1.0.1
 PyJWT==2.9.0
 httpx<0.28
+aiogram==2.25.1
