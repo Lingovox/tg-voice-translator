@@ -20,16 +20,16 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.exc import IntegrityError
 
 
-# ============================
+# ====
 # Logging
-# ============================
+# ====
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("app")
 
 
-# ============================
+# ====
 # Env
-# ============================
+# ====
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
@@ -57,9 +57,9 @@ TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "60"))
 MIN_BILLABLE_SECONDS = int(os.getenv("MIN_BILLABLE_SECONDS", "1"))
 
 
-# ============================
+# ====
 # Constants
-# ============================
+# ====
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing")
 
@@ -91,30 +91,30 @@ PACKAGES = {
 LANGS = [
     ("English", "en"),
     ("Русский", "ru"),
-    ("Deutsch", "de"),
+    ("O‘zbekcha", "uz"),
+    ("हिन्दी", "hi"),
     ("Español", "es"),
-    ("ไทย", "th"),
-    ("Tiếng Việt", "vi"),
-    ("Français", "fr"),
-    ("Türkçe", "tr"),
-    ("中文", "zh"),
+    ("ქართული", "ka"),
     ("العربية", "ar"),
+    ("Português", "pt"),
+    ("Türkçe", "tr"),
+    ("Қазақша", "kk"),
 ]
 
 LANG_LABELS = {code: name for name, code in LANGS}
 SUPPORTED_LANG_CODES = {code for _, code in LANGS}
 
 LANG_ALIASES = {
-    "en": ["english", "английский", "английском", "английскую", "ingliz", "инглиш"],
-    "ru": ["russian", "русский", "русском", "русскую", "russkiy", "рус"],
-    "de": ["german", "deutsch", "немецкий", "немецком", "немецкую", "нем"],
-    "es": ["spanish", "espanol", "español", "испанский", "испанском", "испанскую"],
-    "th": ["thai", "тайский", "тайском", "тайскую"],
-    "vi": ["vietnamese", "tiếng việt", "tieng viet", "вьетнамский", "вьетнамском", "вьетнамскую"],
-    "fr": ["french", "français", "francais", "французский", "французском", "французскую"],
-    "tr": ["turkish", "türkçe", "turkce", "турецкий", "турецком", "турецкую"],
-    "zh": ["chinese", "中文", "китайский", "китайском", "китайскую", "mandarin"],
-    "ar": ["arabic", "العربية", "арабский", "арабском", "арабскую"],
+    "en": ["english", "английский", "инглиш", "ingliz"],
+    "ru": ["russian", "русский", "рус"],
+    "uz": ["uzbek", "o‘zbek", "o'zbek", "узбекский", "uzbekcha"],
+    "hi": ["hindi", "хинди", "हिन्दी"],
+    "es": ["spanish", "испанский", "español"],
+    "ka": ["georgian", "грузинский", "ქართული"],
+    "ar": ["arabic", "арабский", "العربية"],
+    "pt": ["portuguese", "португальский", "português"],
+    "tr": ["turkish", "турецкий", "türkçe"],
+    "kk": ["kazakh", "казахский", "қазақша"],
 }
 
 
@@ -304,7 +304,6 @@ def parse_conversation_setup(text: str) -> Dict[str, str]:
 
 
 
-
 _LANGUAGE_CANON_CACHE: Dict[str, str] = {}
 
 
@@ -399,9 +398,9 @@ def lang_name(code: str) -> str:
     return LANG_LABELS.get((code or "").strip().lower(), (code or "").strip().lower() or "unknown")
 
 
-# ============================
+# ====
 # DB
-# ============================
+# ====
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
@@ -464,9 +463,9 @@ def init_db():
         conn.exec_driver_sql("ALTER TABLE payments ADD COLUMN IF NOT EXISTS external_id VARCHAR")
 
 
-# ============================
+# ====
 # Telegram helpers
-# ============================
+# ====
 def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     url = f"{TG_API}/{method}"
     r = requests.post(url, json=payload, timeout=30)
@@ -574,9 +573,9 @@ def format_status_text(user: User) -> str:
     )
 
 
-# ============================
+# ====
 # NOWPayments helpers
-# ============================
+# ====
 def env_missing() -> list:
     missing = []
     if not NOWPAYMENTS_API_KEY:
@@ -749,9 +748,9 @@ def credit_payment_if_needed(db, payment: Payment) -> bool:
     return True
 
 
-# ============================
+# ====
 # OpenAI helpers
-# ============================
+# ====
 def _openai_headers() -> Dict[str, str]:
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY is missing")
@@ -952,9 +951,9 @@ def user_keyboard(user: User) -> Dict[str, Any]:
     )
 
 
-# ============================
+# ====
 # Billing logic
-# ============================
+# ====
 def decide_billing(user: User, voice_seconds: int) -> Tuple[str, int]:
     voice_seconds = int(max(0, voice_seconds))
     if voice_seconds < MIN_BILLABLE_SECONDS:
@@ -982,9 +981,9 @@ def apply_billing(db, user: User, mode: str, seconds_to_charge: int):
     db.add(user)
 
 
-# ============================
+# ====
 # Support helpers
-# ============================
+# ====
 def is_admin(chat_id: int) -> bool:
     try:
         return str(chat_id) == str(ADMIN_ID) and str(ADMIN_ID).strip() != ""
@@ -1001,9 +1000,9 @@ def admin_notify(text: str):
         pass
 
 
-# ============================
+# ====
 # FastAPI
-# ============================
+# ====
 app = FastAPI()
 
 
@@ -1285,12 +1284,12 @@ async def telegram_webhook(req: Request):
                 with SessionLocal() as db:
                     ticket = db.get(SupportTicket, ticket_id)
                     if not ticket:
-                        tg_send_message(chat_id, "Ticket not found.")
-                        return JSONResponse({"ok": True})
+                    tg_send_message(chat_id, "Ticket not found.")
+                    return JSONResponse({"ok": True})
 
                     tg_send_message(
-                        int(ticket.telegram_id),
-                        f"✅ Support reply (ticket #{ticket.id}):\n{reply_text}"
+                    int(ticket.telegram_id),
+                    f"✅ Support reply (ticket #{ticket.id}):\n{reply_text}"
                     )
 
                     ticket.status = "closed"
@@ -1309,11 +1308,11 @@ async def telegram_webhook(req: Request):
 
                 with SessionLocal() as db:
                     ticket = SupportTicket(
-                        telegram_id=int(chat_id),
-                        message=ticket_text,
-                        status="open",
-                        created_at=datetime.utcnow(),
-                        updated_at=datetime.utcnow(),
+                    telegram_id=int(chat_id),
+                    message=ticket_text,
+                    status="open",
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
                     )
                     db.add(ticket)
                     db.commit()
@@ -1342,17 +1341,17 @@ async def telegram_webhook(req: Request):
 
                     bill_mode, seconds_to_charge = decide_billing(user, duration)
                     if bill_mode == "deny":
-                        kb = user_keyboard(user)
-                        bal_min = max(0, int(user.balance_seconds or 0)) // 60
-                        tg_send_message(
-                            chat_id,
-                            "⛔ Not enough balance.\n\n"
-                            f"Your balance: {bal_min} min\n"
-                            f"Free messages left: {user.trial_left}\n\n"
-                            "Tap “Buy minutes” to top up.",
-                            reply_markup=kb
-                        )
-                        return JSONResponse({"ok": True})
+                    kb = user_keyboard(user)
+                    bal_min = max(0, int(user.balance_seconds or 0)) // 60
+                    tg_send_message(
+                    chat_id,
+                    "⛔ Not enough balance.\n\n"
+                    f"Your balance: {bal_min} min\n"
+                    f"Free messages left: {user.trial_left}\n\n"
+                    "Tap “Buy minutes” to top up.",
+                    reply_markup=kb
+                    )
+                    return JSONResponse({"ok": True})
 
                 gf = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30).json()
                 if not gf.get("ok"):
@@ -1365,8 +1364,8 @@ async def telegram_webhook(req: Request):
 
                 try:
                     with SessionLocal() as db:
-                        user = ensure_user(db, int(chat_id))
-                        user_mode = user.mode or "translate"
+                    user = ensure_user(db, int(chat_id))
+                    user_mode = user.mode or "translate"
 
                     transcription = openai_transcribe_verbose(audio)
                     original_text, detected_lang = parse_transcription_result(transcription)
@@ -1374,73 +1373,73 @@ async def telegram_webhook(req: Request):
                     telegram_lang = normalize_lang_code(((msg.get("from") or {}).get("language_code") or ""))
 
                     if not original_text:
-                        raise RuntimeError("Empty transcription")
+                    raise RuntimeError("Empty transcription")
 
                     if user_mode == "conversation":
-                        with SessionLocal() as db:
-                            user = ensure_user(db, int(chat_id))
-                            source_lang = (user.conversation_source_lang or "").strip()
-                            target_lang = (user.conversation_target_lang or "").strip()
+                    with SessionLocal() as db:
+                    user = ensure_user(db, int(chat_id))
+                    source_lang = (user.conversation_source_lang or "").strip()
+                    target_lang = (user.conversation_target_lang or "").strip()
 
-                            setup = parse_conversation_setup(original_text)
-                            if setup.get("has_setup_command") and setup.get("target_lang") and setup.get("message_text"):
-                                target_lang = canonicalize_language_name(setup.get("target_lang", "").strip())
-                                source_text = setup.get("message_text", "").strip()
+                    setup = parse_conversation_setup(original_text)
+                    if setup.get("has_setup_command") and setup.get("target_lang") and setup.get("message_text"):
+                    target_lang = canonicalize_language_name(setup.get("target_lang", "").strip())
+                    source_text = setup.get("message_text", "").strip()
 
-                                if not target_lang:
-                                    raise RuntimeError(
-                                        "Conversation is not configured. Start with a phrase like: 'Translate to Spanish: hello, how are you?'"
-                                    )
-                                if not source_text:
-                                    raise RuntimeError(
-                                        "I understood the target language, but there is no phrase to translate after the command."
-                                    )
+                    if not target_lang:
+                    raise RuntimeError(
+                    "Conversation is not configured. Start with a phrase like: 'Translate to Spanish: hello, how are you?'"
+                    )
+                    if not source_text:
+                    raise RuntimeError(
+                    "I understood the target language, but there is no phrase to translate after the command."
+                    )
 
-                                source_lang = canonicalize_language_name(detect_language_name_from_text(source_text))
-                                if normalize_language_name(source_lang) == normalize_language_name(target_lang):
-                                    raise RuntimeError(
-                                        "Source and target languages are the same. Please choose another target language."
-                                    )
+                    source_lang = canonicalize_language_name(detect_language_name_from_text(source_text))
+                    if normalize_language_name(source_lang) == normalize_language_name(target_lang):
+                    raise RuntimeError(
+                    "Source and target languages are the same. Please choose another target language."
+                    )
 
-                                user.conversation_source_lang = source_lang
-                                user.conversation_target_lang = target_lang
-                                user.updated_at = datetime.utcnow()
-                                db.add(user)
-                                db.commit()
-                                db.refresh(user)
+                    user.conversation_source_lang = source_lang
+                    user.conversation_target_lang = target_lang
+                    user.updated_at = datetime.utcnow()
+                    db.add(user)
+                    db.commit()
+                    db.refresh(user)
 
-                                translated_text = openai_translate_text(
-                                    source_text,
-                                    target_lang,
-                                    source_lang=source_lang
-                                )
-                            else:
-                                if not source_lang or not target_lang:
-                                    raise RuntimeError(
-                                        "Conversation is not configured. Start with a phrase like: 'Translate to Spanish: hello, how are you?'"
-                                    )
-
-                                incoming_lang = canonicalize_language_name(detect_language_name_from_text(original_text))
-                                translate_to, resolved_incoming_lang = decide_conversation_target_any(
-                                    source_lang,
-                                    target_lang,
-                                    incoming_lang
-                                )
-
-                                translated_text = openai_translate_text(
-                                    original_text,
-                                    translate_to,
-                                    source_lang=resolved_incoming_lang
-                                )
-
-                        tts_audio = openai_tts(translated_text)
+                    translated_text = openai_translate_text(
+                    source_text,
+                    target_lang,
+                    source_lang=source_lang
+                    )
                     else:
-                        with SessionLocal() as db:
-                            user = ensure_user(db, int(chat_id))
-                            target_lang = user.target_lang
+                    if not source_lang or not target_lang:
+                    raise RuntimeError(
+                    "Conversation is not configured. Start with a phrase like: 'Translate to Spanish: hello, how are you?'"
+                    )
 
-                        translated_text = openai_translate_text(original_text, target_lang)
-                        tts_audio = openai_tts(translated_text)
+                    incoming_lang = canonicalize_language_name(detect_language_name_from_text(original_text))
+                    translate_to, resolved_incoming_lang = decide_conversation_target_any(
+                    source_lang,
+                    target_lang,
+                    incoming_lang
+                    )
+
+                    translated_text = openai_translate_text(
+                    original_text,
+                    translate_to,
+                    source_lang=resolved_incoming_lang
+                    )
+
+                    tts_audio = openai_tts(translated_text)
+                    else:
+                    with SessionLocal() as db:
+                    user = ensure_user(db, int(chat_id))
+                    target_lang = user.target_lang
+
+                    translated_text = openai_translate_text(original_text, target_lang)
+                    tts_audio = openai_tts(translated_text)
 
                 except Exception as e:
                     log.exception("Voice pipeline error")
@@ -1452,9 +1451,9 @@ async def telegram_webhook(req: Request):
 
                     bill_mode, seconds_to_charge = decide_billing(user, duration)
                     if bill_mode == "deny":
-                        kb = user_keyboard(user)
-                        tg_send_message(chat_id, "⛔ Not enough balance (re-check).", reply_markup=kb)
-                        return JSONResponse({"ok": True})
+                    kb = user_keyboard(user)
+                    tg_send_message(chat_id, "⛔ Not enough balance (re-check).", reply_markup=kb)
+                    return JSONResponse({"ok": True})
 
                     apply_billing(db, user, bill_mode, seconds_to_charge)
                     db.commit()
@@ -1463,9 +1462,9 @@ async def telegram_webhook(req: Request):
                     kb = user_keyboard(user)
                     caption = None
                     if bill_mode == "trial":
-                        caption = f"🎁 Trial message used. Free left: {user.trial_left}"
+                    caption = f"🎁 Trial message used. Free left: {user.trial_left}"
                     elif bill_mode == "paid":
-                        caption = f"💳 Charged: {seconds_to_charge}s. Balance: {max(0, int(user.balance_seconds)) // 60} min"
+                    caption = f"💳 Charged: {seconds_to_charge}s. Balance: {max(0, int(user.balance_seconds)) // 60} min"
 
                 tg_send_voice(chat_id, tts_audio, caption=caption)
                 tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
@@ -1476,17 +1475,17 @@ async def telegram_webhook(req: Request):
 
                     mode, seconds_to_charge = decide_billing(user, duration)
                     if mode == "deny":
-                        kb = user_keyboard(user)
-                        bal_min = max(0, int(user.balance_seconds or 0)) // 60
-                        tg_send_message(
-                            chat_id,
-                            "⛔ Not enough balance.\n\n"
-                            f"Your balance: {bal_min} min\n"
-                            f"Free messages left: {user.trial_left}\n\n"
-                            "Tap “Buy minutes” to top up.",
-                            reply_markup=kb
-                        )
-                        return JSONResponse({"ok": True})
+                    kb = user_keyboard(user)
+                    bal_min = max(0, int(user.balance_seconds or 0)) // 60
+                    tg_send_message(
+                    chat_id,
+                    "⛔ Not enough balance.\n\n"
+                    f"Your balance: {bal_min} min\n"
+                    f"Free messages left: {user.trial_left}\n\n"
+                    "Tap “Buy minutes” to top up.",
+                    reply_markup=kb
+                    )
+                    return JSONResponse({"ok": True})
 
                 gf = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30).json()
                 if not gf.get("ok"):
@@ -1499,19 +1498,19 @@ async def telegram_webhook(req: Request):
 
                 try:
                     with SessionLocal() as db:
-                        user = db.get(User, int(chat_id))
-                        if not user:
-                            user = User(
-                                telegram_id=int(chat_id),
-                                target_lang="en",
-                                trial_left=TRIAL_LIMIT,
-                                trial_messages=0,
-                                balance_seconds=0,
-                            )
-                            db.add(user)
-                            db.commit()
-                            db.refresh(user)
-                        target_lang = user.target_lang
+                    user = db.get(User, int(chat_id))
+                    if not user:
+                    user = User(
+                    telegram_id=int(chat_id),
+                    target_lang="en",
+                    trial_left=TRIAL_LIMIT,
+                    trial_messages=0,
+                    balance_seconds=0,
+                    )
+                    db.add(user)
+                    db.commit()
+                    db.refresh(user)
+                    target_lang = user.target_lang
 
                     original_text = openai_transcribe(audio)
                     translated_text = openai_translate_text(original_text, target_lang)
@@ -1526,9 +1525,9 @@ async def telegram_webhook(req: Request):
 
                     mode, seconds_to_charge = decide_billing(user, duration)
                     if mode == "deny":
-                        kb = user_keyboard(user)
-                        tg_send_message(chat_id, "⛔ Not enough balance (re-check).", reply_markup=kb)
-                        return JSONResponse({"ok": True})
+                    kb = user_keyboard(user)
+                    tg_send_message(chat_id, "⛔ Not enough balance (re-check).", reply_markup=kb)
+                    return JSONResponse({"ok": True})
 
                     apply_billing(db, user, mode, seconds_to_charge)
                     db.commit()
@@ -1537,9 +1536,9 @@ async def telegram_webhook(req: Request):
                     kb = user_keyboard(user)
                     caption = None
                     if mode == "trial":
-                        caption = f"🎁 Trial message used. Free left: {user.trial_left}"
+                    caption = f"🎁 Trial message used. Free left: {user.trial_left}"
                     elif mode == "paid":
-                        caption = f"💳 Charged: {seconds_to_charge}s. Balance: {max(0, int(user.balance_seconds)) // 60} min"
+                    caption = f"💳 Charged: {seconds_to_charge}s. Balance: {max(0, int(user.balance_seconds)) // 60} min"
 
                 tg_send_voice(chat_id, tts_audio, caption=caption)
                 tg_send_message(chat_id, format_status_text(user), reply_markup=kb)
@@ -1588,12 +1587,12 @@ async def telegram_webhook(req: Request):
                     db.refresh(user)
 
                     tg_send_message(
-                        chat_id,
-                        "🗣 Conversation mode enabled.\n\n"
-                        "Start with a voice phrase like:\n"
-                        "'Translate to Spanish: hello, how are you?'\n\n"
-                        "Conversation mode ignores the language buttons in the main menu and uses only your voice command.",
-                        reply_markup=user_keyboard(user),
+                    chat_id,
+                    "🗣 Conversation mode enabled.\n\n"
+                    "Start with a voice phrase like:\n"
+                    "'Translate to Spanish: hello, how are you?'\n\n"
+                    "Conversation mode ignores the language buttons in the main menu and uses only your voice command.",
+                    reply_markup=user_keyboard(user),
                     )
 
                 tg_answer_callback(cq_id)
@@ -1610,11 +1609,11 @@ async def telegram_webhook(req: Request):
                     db.refresh(user)
 
                     tg_send_message(
-                        chat_id,
-                        "🔄 Conversation reset.\n\n"
-                        "Send a new setup phrase like:\n"
-                        "'Translate to German: where is the hotel?'",
-                        reply_markup=user_keyboard(user),
+                    chat_id,
+                    "🔄 Conversation reset.\n\n"
+                    "Send a new setup phrase like:\n"
+                    "'Translate to German: where is the hotel?'",
+                    reply_markup=user_keyboard(user),
                     )
 
                 tg_answer_callback(cq_id)
@@ -1650,8 +1649,8 @@ async def telegram_webhook(req: Request):
 
                 if not txn["ok"]:
                     tg_send_message(
-                        chat_id,
-                        f"Paddle checkout create failed\nHTTP {txn.get('status')}\n{txn.get('raw') or txn.get('data')}"
+                    chat_id,
+                    f"Paddle checkout create failed\nHTTP {txn.get('status')}\n{txn.get('raw') or txn.get('data')}"
                     )
                     tg_answer_callback(cq_id)
                     return JSONResponse({"ok": True})
@@ -1668,32 +1667,32 @@ async def telegram_webhook(req: Request):
 
                 with SessionLocal() as db:
                     try:
-                        p = Payment(
-                            telegram_id=int(chat_id),
-                            order_id=order_id,
-                            invoice_id=transaction_id,
-                            external_id=transaction_id,
-                            package_code=package_code,
-                            amount_usd=int(PACKAGES[package_code]["usd"]),
-                            provider="paddle",
-                            status="created",
-                            created_at=datetime.utcnow(),
-                            updated_at=datetime.utcnow(),
-                        )
-                        db.add(p)
-                        db.commit()
+                    p = Payment(
+                    telegram_id=int(chat_id),
+                    order_id=order_id,
+                    invoice_id=transaction_id,
+                    external_id=transaction_id,
+                    package_code=package_code,
+                    amount_usd=int(PACKAGES[package_code]["usd"]),
+                    provider="paddle",
+                    status="created",
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                    )
+                    db.add(p)
+                    db.commit()
                     except IntegrityError as e:
-                        db.rollback()
-                        log.warning(f"Paddle payment insert IntegrityError: {e}")
+                    db.rollback()
+                    log.warning(f"Paddle payment insert IntegrityError: {e}")
                     except Exception as e:
-                        db.rollback()
-                        tg_send_message(chat_id, f"DB error: {e}")
-                        tg_answer_callback(cq_id)
-                        return JSONResponse({"ok": True})
+                    db.rollback()
+                    tg_send_message(chat_id, f"DB error: {e}")
+                    tg_answer_callback(cq_id)
+                    return JSONResponse({"ok": True})
 
                 kb = {
                     "inline_keyboard": [
-                        [{"text": "Pay with card 💳", "url": checkout_url}],
+                    [{"text": "Pay with card 💳", "url": checkout_url}],
                     ]
                 }
                 tg_send_message(
@@ -1742,8 +1741,8 @@ async def telegram_webhook(req: Request):
 
                 if not np["ok"]:
                     tg_send_message(
-                        chat_id,
-                        f"Invoice create failed\nHTTP {np.get('status')}\n{np.get('raw') or np.get('data')}"
+                    chat_id,
+                    f"Invoice create failed\nHTTP {np.get('status')}\n{np.get('raw') or np.get('data')}"
                     )
                     tg_answer_callback(cq_id)
                     return JSONResponse({"ok": True})
@@ -1768,39 +1767,39 @@ async def telegram_webhook(req: Request):
 
                 with SessionLocal() as db:
                     try:
-                        p = Payment(
-                            telegram_id=int(chat_id),
-                            order_id=order_id,
-                            invoice_id=str(invoice_id),
-                            package_code=package_code,
-                            amount_usd=int(amount_usd),
-                            provider="nowpayments",
-                            external_id=str(invoice_id),
-                            status="created",
-                            created_at=datetime.utcnow(),
-                            updated_at=datetime.utcnow(),
-                        )
-                        db.add(p)
-                        db.commit()
+                    p = Payment(
+                    telegram_id=int(chat_id),
+                    order_id=order_id,
+                    invoice_id=str(invoice_id),
+                    package_code=package_code,
+                    amount_usd=int(amount_usd),
+                    provider="nowpayments",
+                    external_id=str(invoice_id),
+                    status="created",
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                    )
+                    db.add(p)
+                    db.commit()
                     except IntegrityError as e:
-                        db.rollback()
-                        log.warning(f"Payment insert IntegrityError: {e}")
+                    db.rollback()
+                    log.warning(f"Payment insert IntegrityError: {e}")
                     except Exception as e:
-                        db.rollback()
-                        tg_send_message(chat_id, f"DB error: {e}")
-                        tg_answer_callback(cq_id)
-                        return JSONResponse({"ok": True})
+                    db.rollback()
+                    tg_send_message(chat_id, f"DB error: {e}")
+                    tg_answer_callback(cq_id)
+                    return JSONResponse({"ok": True})
 
                 if pay_url:
                     kb = {
-                        "inline_keyboard": [
-                            [{"text": "Go to payment ✅", "url": pay_url}],
-                        ]
+                    "inline_keyboard": [
+                    [{"text": "Go to payment ✅", "url": pay_url}],
+                    ]
                     }
                     tg_send_message(
-                        chat_id,
-                        f"✅ Invoice created.\nAmount: ${amount_usd}\nPackage: {package_code}",
-                        reply_markup=kb
+                    chat_id,
+                    f"✅ Invoice created.\nAmount: ${amount_usd}\nPackage: {package_code}",
+                    reply_markup=kb
                     )
                 else:
                     tg_send_message(chat_id, f"✅ Invoice created: {invoice_id}\n(No payment link in response)")
@@ -1940,8 +1939,8 @@ async def paddle_postback(req: Request):
                 except IntegrityError:
                     db.rollback()
                     p = db.query(Payment).filter(
-                        Payment.provider == "paddle",
-                        Payment.invoice_id == transaction_id
+                    Payment.provider == "paddle",
+                    Payment.invoice_id == transaction_id
                     ).first()
 
             if not p:
