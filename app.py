@@ -5,18 +5,25 @@ from fastapi.responses import HTMLResponse
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# Конфигурация (замените на ваши переменные окружения или значения)
-TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+# ============================
+# Configuration
+# ============================
+# Изменено на TELEGRAM_BOT_TOKEN по вашему запросу
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 BOT_USERNAME = os.getenv("BOT_USERNAME", "lingovox_bot")
 TRIAL_LIMIT = 5
 TRIAL_MAX_SECONDS = 60
 
+# Проверка наличия токена перед запуском
+if not TOKEN:
+    logging.error("ERROR: TELEGRAM_BOT_TOKEN is not set in environment variables!")
+
 app = FastAPI()
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+bot = Bot(token=TOKEN) if TOKEN else None
+dp = Dispatcher(bot) if bot else None
 
 # ============================
-# Constants: Обновленный список языков[cite: 1]
+# Constants: Языковая панель
 # ============================
 LANGS = [
     ("English", "en"),
@@ -32,9 +39,8 @@ LANGS = [
 ]
 
 LANG_LABELS = {code: name for name, code in LANGS}
-SUPPORTED_LANG_CODES = {code for _, code in LANGS}
 
-# Алиасы для распознавания языков в голосовых командах[cite: 1]
+# Алиасы для режима Conversation и голосовых команд[cite: 1]
 LANG_ALIASES = {
     "en": ["english", "английский", "ingliz", "английском"],
     "ru": ["russian", "русский", "русском", "русскую"],
@@ -49,12 +55,12 @@ LANG_ALIASES = {
 }
 
 # ============================
-# Landing Page: FastAPI Route
+# Landing Page: FastAPI Route[cite: 1]
 # ============================
 @app.get("/", response_class=HTMLResponse)
 def landing():
-    bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
-    langs_list = ", ".join([name for name, _ in LANGS])
+    bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "#"
+    langs_display = ", ".join([name for name, _ in LANGS])
 
     html = f"""<!doctype html>
 <html lang="en">
@@ -63,58 +69,31 @@ def landing():
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Lingovox — AI Voice Translator</title>
   <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f7f9; color: #222; margin: 0; padding: 20px; line-height: 1.5; }}
+    body {{ font-family: -apple-system, sans-serif; background: #f4f7f9; color: #222; margin: 0; padding: 20px; }}
     .wrap {{ max-width: 900px; margin: 0 auto; }}
-    .badge {{ display: inline-flex; align-items: center; background: #fff; border: 1px solid #e1e8ed; padding: 4px 12px; border-radius: 20px; font-size: 14px; font-weight: 600; }}
-    .badge span:first-child {{ color: #0088cc; margin-right: 6px; }}
-    .hero {{ display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 24px; }}
-    @media (max-width: 600px) {{ .hero {{ grid-template-columns: 1fr; }} }}
-    .card {{ background: #fff; border: 1px solid #e1e8ed; padding: 24px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }}
-    h1 {{ font-size: 28px; margin: 0 0 16px; line-height: 1.2; }}
-    h2 {{ font-size: 18px; margin: 24px 0 12px; color: #555; text-transform: uppercase; letter-spacing: 0.5px; }}
-    p {{ color: #444; margin: 0 0 16px; }}
-    .btn {{ display: inline-block; background: #0088cc; color: #fff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: 600; transition: background 0.2s; }}
-    .btn:hover {{ background: #0077b5; }}
-    .price {{ display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #f0f0f0; }}
-    .price b {{ font-size: 16px; }}
-    .price span {{ font-weight: 700; color: #0088cc; }}
+    .card {{ background: #fff; border: 1px solid #e1e8ed; padding: 24px; border-radius: 12px; margin-top: 20px; shadow: 0 2px 4px rgba(0,0,0,0.05); }}
+    .btn {{ display: inline-block; background: #0088cc; color: #fff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: 600; }}
+    .price {{ display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #f0f0f0; }}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="badge">🎙️ <span>Lingovox</span> <span>— AI Voice Translator for Telegram</span></div>
-
-    <div class="hero">
-      <div class="card">
-        <h1>Translate voice messages — instantly.</h1>
-        <p>
-          Lingovox is a Telegram bot that converts your voice message to text, translates it to your selected language, 
-          and replies with a natural-sounding voice message.
-        </p>
-        <div style="margin-top:12px;">
-          {f'<a class="btn" href="{bot_link}" target="_blank">Open Telegram bot ↗</a>' if bot_link else '<span>Configure BOT_USERNAME</span>'}
-        </div>
-
-        <h2>Supported languages</h2>
-        <p>{langs_list}</p>
-
-        <h2>How it works</h2>
-        <p>1. Select target language<br>2. Send voice message<br>3. Receive translated voice back</p>
-      </div>
-
-      <div class="card">
-        <h2>Pricing (credits)</h2>
-        <div class="price"><b>30 minutes</b><span>$10</span></div>
-        <div class="price"><b>60 minutes</b><span>$15</span></div>
-        <div class="price"><b>180 minutes</b><span>$30</span></div>
-        <div class="price"><b>600 minutes</b><span>$70</span></div>
-
-        <h2 style="margin-top:18px;">Free trial</h2>
-        <p>New users get <b>{TRIAL_LIMIT}</b> free messages (up to <b>{TRIAL_MAX_SECONDS}s</b> each).</p>
-
-        <h2 style="margin-top:18px;">Integration</h2>
-        <p>Secure payments powered by <b>Paddle</b>[cite: 1].</p>
-      </div>
+    <div class="card">
+      <h1>Lingovox: Translate Voice Instantly</h1>
+      <p>AI-powered voice-to-voice translation in Telegram. Support for Kazakh, Uzbek and more.[cite: 1]</p>
+      <a class="btn" href="{bot_link}">Start Translating ↗</a>
+      
+      <h2>Supported Languages</h2>
+      <p>{langs_display}</p>
+    </div>
+    
+    <div class="card">
+      <h2>Pricing & Payments</h2>
+      <div class="price"><b>30 min</b><span>$10</span></div>
+      <div class="price"><b>60 min</b><span>$15</span></div>
+      <p style="margin-top:15px; font-size: 0.9em; color: #666;">
+        Secure payments via <b>Paddle</b> and <b>NOWPayments</b>.[cite: 1]
+      </p>
     </div>
   </div>
 </body>
@@ -122,25 +101,24 @@ def landing():
     return HTMLResponse(content=html)
 
 # ============================
-# Bot Logic: Основные функции
+# Bot Handlers
 # ============================
-@dp.message_handler(commands=['start'])
-async def send_welcome(message: types.Message):
-    keyboard = InlineKeyboardMarkup(row_width=2)
-    buttons = [InlineKeyboardButton(text=name, callback_data=f"set_lang_{code}") for name, code in LANGS]
-    keyboard.add(*buttons)
-    await message.answer("Welcome to Lingovox! Please select the target language for translation:", reply_markup=keyboard)
+if dp:
+    @dp.message_handler(commands=['start'])
+    async def send_welcome(message: types.Message):
+        keyboard = InlineKeyboardMarkup(row_width=2)
+        buttons = [InlineKeyboardButton(text=name, callback_data=f"set_lang_{code}") for name, code in LANGS]
+        keyboard.add(*buttons)
+        await message.answer("Select target language:", reply_markup=keyboard)
 
-@dp.callback_query_handler(lambda c: c.data.startswith('set_lang_'))
-async def process_language_selection(callback_query: types.CallbackQuery):
-    lang_code = callback_query.data.split('_')[-1]
-    lang_name = LANG_LABELS.get(lang_code, lang_code)
-    # Здесь должна быть логика сохранения выбора пользователя в БД
-    await bot.answer_callback_query(callback_query.id)
-    await bot.send_message(callback_query.from_user.id, f"Target language set to: **{lang_name}**")
+    @dp.callback_query_handler(lambda c: c.data.startswith('set_lang_'))
+    async def process_lang(callback_query: types.CallbackQuery):
+        lang_code = callback_query.data.split('_')[-1]
+        lang_name = LANG_LABELS.get(lang_code, lang_code)
+        await bot.answer_callback_query(callback_query.id)
+        await bot.send_message(callback_query.from_user.id, f"Target language: {lang_name}")
 
-# Запуск через Webhook или Polling (для примера polling)
 if __name__ == '__main__':
-    import asyncio
     from aiogram import executor
-    executor.start_polling(dp, skip_updates=True)
+    if dp:
+        executor.start_polling(dp, skip_updates=True)
