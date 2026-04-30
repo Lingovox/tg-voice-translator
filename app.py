@@ -91,30 +91,30 @@ PACKAGES = {
 LANGS = [
     ("English", "en"),
     ("Русский", "ru"),
-    ("O'zbekcha", "uz"),
-    ("हिन्दी", "hi"),
+    ("Deutsch", "de"),
     ("Español", "es"),
-    ("ქართული", "ka"),
-    ("العربية", "ar"),
-    ("Português", "pt"),
+    ("ไทย", "th"),
+    ("Tiếng Việt", "vi"),
+    ("Français", "fr"),
     ("Türkçe", "tr"),
-    ("Қазақша", "kk"),
+    ("中文", "zh"),
+    ("العربية", "ar"),
 ]
 
 LANG_LABELS = {code: name for name, code in LANGS}
 SUPPORTED_LANG_CODES = {code for _, code in LANGS}
 
 LANG_ALIASES = {
-    "en": ["english", "английский", "инглиш", "ingliz"],
-    "ru": ["russian", "русский", "рус"],
-    "uz": ["uzbek", "o'zbek", "узбекский", "uzbekcha"],
-    "hi": ["hindi", "хинди", "हिन्दी"],
-    "es": ["spanish", "испанский", "español"],
-    "ka": ["georgian", "грузинский", "ქართული"],
-    "ar": ["arabic", "арабский", "العربية"],
-    "pt": ["portuguese", "португальский", "português"],
-    "tr": ["turkish", "турецкий", "türkçe"],
-    "kk": ["kazakh", "казахский", "қазақша"],
+    "en": ["english", "английский", "английском", "английскую", "ingliz", "инглиш"],
+    "ru": ["russian", "русский", "русском", "русскую", "russkiy", "рус"],
+    "de": ["german", "deutsch", "немецкий", "немецком", "немецкую", "нем"],
+    "es": ["spanish", "espanol", "español", "испанский", "испанском", "испанскую"],
+    "th": ["thai", "тайский", "тайском", "тайскую"],
+    "vi": ["vietnamese", "tiếng việt", "tieng viet", "вьетнамский", "вьетнамском", "вьетнамскую"],
+    "fr": ["french", "français", "francais", "французский", "французском", "французскую"],
+    "tr": ["turkish", "türkçe", "turkce", "турецкий", "турецком", "турецкую"],
+    "zh": ["chinese", "中文", "китайский", "китайском", "китайскую", "mandarin"],
+    "ar": ["arabic", "العربية", "арабский", "арабском", "арабскую"],
 }
 
 
