@@ -701,4 +701,4 @@ def detect_language_from_text(text: str) -> str:
     out = r.json()["choices"][0]["message"]["content"]
     try:
         parsed = json.loads(out)
-        language = str(parsed.get("
+        language = str(parsed.get
