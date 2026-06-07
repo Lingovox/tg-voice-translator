@@ -1066,6 +1066,65 @@ def startup():
     init_db()
 
 
+SUPPORT_EMAIL = "neural.flow.io@tutamail.com"
+SITE_NAME = "Lingovox"
+
+
+def _page(title: str, body: str) -> str:
+    bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "#"
+    year = datetime.utcnow().year
+    return f"""<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>{title} — {SITE_NAME}</title>
+<style>
+:root{{--bg:#0b1020;--card:#121a33;--ink:#e9eefc;--muted:#9fb0d8;--accent:#3b6ef0;--accent2:#7aa2ff;--line:#23304f}}
+*{{box-sizing:border-box}}
+body{{background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;line-height:1.6}}
+a{{color:var(--accent2);text-decoration:none}}
+a:hover{{text-decoration:underline}}
+.wrap{{max-width:860px;margin:0 auto;padding:32px 20px 64px}}
+.nav{{display:flex;align-items:center;justify-content:space-between;padding:18px 0}}
+.brand{{font-weight:700;font-size:20px;letter-spacing:.2px}}
+.brand span{{color:var(--accent2)}}
+.hero{{text-align:center;padding:48px 16px 28px}}
+.hero h1{{font-size:40px;line-height:1.15;margin:0 0 14px}}
+.hero p{{font-size:18px;color:var(--muted);max-width:560px;margin:0 auto 26px}}
+.btn{{display:inline-block;background:var(--accent);color:#fff;padding:14px 30px;border-radius:12px;font-weight:600;font-size:16px}}
+.btn:hover{{background:#2f5fd6;text-decoration:none}}
+.grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:36px 0}}
+.feat{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px}}
+.feat h3{{margin:0 0 8px;font-size:17px}}
+.feat p{{margin:0;color:var(--muted);font-size:15px}}
+.section-title{{text-align:center;font-size:26px;margin:48px 0 8px}}
+.section-sub{{text-align:center;color:var(--muted);margin:0 0 28px}}
+.prices{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}}
+.price{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:24px;text-align:center}}
+.price .min{{font-size:15px;color:var(--muted)}}
+.price .amt{{font-size:32px;font-weight:700;margin:6px 0}}
+.price .per{{font-size:13px;color:var(--muted)}}
+.langs{{text-align:center;color:var(--muted);margin:26px auto;max-width:640px}}
+.doc h1{{font-size:30px;margin:8px 0 4px}}
+.doc .upd{{color:var(--muted);font-size:14px;margin-bottom:24px}}
+.doc h2{{font-size:19px;margin:28px 0 8px}}
+.doc p,.doc li{{color:#cdd8f4}}
+.doc ul{{padding-left:20px}}
+.footer{{border-top:1px solid var(--line);margin-top:48px;padding-top:22px;text-align:center;color:var(--muted);font-size:14px}}
+.footer a{{margin:0 10px}}
+</style></head><body><div class="wrap">
+<div class="nav">
+  <div class="brand">🎙 Lingo<span>vox</span></div>
+  <a class="brand-link" href="{bot_link}">Open bot →</a>
+</div>
+{body}
+<div class="footer">
+  © {year} {SITE_NAME} ·
+  <a href="/">Home</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a>
+  <br/>Contact: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>
+</div>
+</div></body></html>"""
+
+
 @app.get("/healthz", response_class=PlainTextResponse)
 def healthz():
     return "ok"
@@ -1075,27 +1134,112 @@ def healthz():
 def landing():
     bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "#"
     langs = ", ".join(name for name, _ in LANGS)
-    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Lingovox</title><style>
-body{{background:#0b1020;color:#e9eefc;font-family:system-ui,sans-serif;padding:40px;margin:0}}
-a{{color:#7aa2ff}}.card{{background:#111a33;padding:28px;border-radius:16px;max-width:600px;margin:40px auto;box-shadow:0 10px 40px rgba(0,0,0,.4)}}
-.btn{{display:inline-block;margin-top:16px;background:#3b6ef0;color:#fff;padding:12px 22px;border-radius:10px;text-decoration:none}}
-</style></head><body><div class="card">
-<h1>Lingovox AI</h1><p>AI voice translator for Telegram.</p>
-<p><b>Supported:</b> {langs}</p>
-<a class="btn" href="{bot_link}">Open Bot</a></div></body></html>"""
-    return HTMLResponse(content=html)
+
+    price_cards = ""
+    for code in ("P60", "P180", "P600"):
+        pkg = PACKAGES[code]
+        per = pkg["usd"] / pkg["minutes"]
+        price_cards += (
+            f'<div class="price"><div class="min">{pkg["minutes"]} minutes</div>'
+            f'<div class="amt">${pkg["usd"]}</div>'
+            f'<div class="per">${per:.2f} / min</div></div>'
+        )
+
+    body = f"""
+<div class="hero">
+  <h1>Speak any language.<br/>Be understood instantly.</h1>
+  <p>Lingovox is an AI voice translator in Telegram. Send a voice message — get a natural voice translation back in seconds.</p>
+  <a class="btn" href="{bot_link}">Start translating →</a>
+</div>
+
+<div class="grid">
+  <div class="feat"><h3>🎙 Voice in, voice out</h3><p>Speak naturally. Lingovox transcribes, translates and replies with a clear voice message.</p></div>
+  <div class="feat"><h3>🗣 Live conversation</h3><p>Set a language pair by voice once, then talk back and forth — it auto-detects each side.</p></div>
+  <div class="feat"><h3>🌍 Any language</h3><p>Translate into dozens of languages, with optional voice replies in your target language.</p></div>
+  <div class="feat"><h3>🎁 Free to try</h3><p>Your first messages are on us. Top up minutes only when you need more.</p></div>
+</div>
+
+<h2 class="section-title">Simple pricing</h2>
+<p class="section-sub">Pay only for what you use. No subscription.</p>
+<div class="prices">{price_cards}</div>
+
+<div class="langs"><b>Popular target languages:</b><br/>{langs} — and many more in conversation mode.</div>
+
+<div class="hero" style="padding-top:8px">
+  <a class="btn" href="{bot_link}">Open Lingovox in Telegram</a>
+</div>
+"""
+    return HTMLResponse(content=_page("AI voice translator", body))
 
 
 @app.get("/terms", response_class=HTMLResponse)
 def terms():
-    return HTMLResponse("<h1>Terms of Service</h1><p>Lingovox voice translation service.</p>")
+    body = f"""
+<div class="doc">
+<h1>Terms of Service</h1>
+<div class="upd">Last updated: {datetime.utcnow():%B %d, %Y}</div>
+
+<p>These Terms of Service ("Terms") govern your use of {SITE_NAME} (the "Service"), an AI-powered voice translation bot available through Telegram. By using the Service, you agree to these Terms.</p>
+
+<h2>1. The Service</h2>
+<p>{SITE_NAME} transcribes voice messages, translates the text, and returns a synthesized voice translation. The Service relies on third-party AI providers to process audio and text. Translation accuracy is provided on a best-effort basis and may contain errors; do not rely on it for critical, legal, medical, or safety-related communication.</p>
+
+<h2>2. Free trial and paid minutes</h2>
+<p>New users receive a limited number of free messages. Beyond the trial, the Service is used by purchasing minute packages. Minutes are consumed based on the length of each processed voice message. Prices are shown in the bot before purchase and are charged in US dollars.</p>
+
+<h2>3. Payments and refunds</h2>
+<p>Payments are processed by our authorized reseller and Merchant of Record, Paddle.com, which handles billing, payment, and related support. Purchased minutes are added to your balance immediately after successful payment. Because access is granted instantly, purchases are generally non-refundable once minutes have been used. If you experience a billing problem or believe a charge was made in error, contact us at <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a> and we will review your request in good faith.</p>
+
+<h2>4. Acceptable use</h2>
+<p>You agree not to use the Service to process unlawful content, to infringe the rights of others, or to attempt to disrupt, reverse-engineer, or overload the Service. We may suspend access for abuse or fraudulent activity.</p>
+
+<h2>5. Availability</h2>
+<p>We aim to keep the Service available but do not guarantee uninterrupted operation. The Service may be modified, suspended, or discontinued at any time. Features and pricing may change.</p>
+
+<h2>6. Limitation of liability</h2>
+<p>The Service is provided "as is" without warranties of any kind. To the maximum extent permitted by law, {SITE_NAME} shall not be liable for any indirect, incidental, or consequential damages arising from the use of, or inability to use, the Service.</p>
+
+<h2>7. Contact</h2>
+<p>Questions about these Terms can be sent to <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>, or via the Support button inside the bot.</p>
+</div>
+"""
+    return HTMLResponse(content=_page("Terms of Service", body))
 
 
 @app.get("/privacy", response_class=HTMLResponse)
 def privacy():
-    return HTMLResponse("<h1>Privacy Policy</h1><p>Voice data is processed only to provide translations.</p>")
+    body = f"""
+<div class="doc">
+<h1>Privacy Policy</h1>
+<div class="upd">Last updated: {datetime.utcnow():%B %d, %Y}</div>
+
+<p>This Privacy Policy explains what information {SITE_NAME} (the "Service") collects and how it is used. By using the Service, you agree to this policy.</p>
+
+<h2>1. Information we collect</h2>
+<ul>
+  <li><b>Telegram identifier:</b> your numeric Telegram ID, used to maintain your balance, settings, and language preference.</li>
+  <li><b>Settings:</b> your selected interface and target languages, trial and balance state.</li>
+  <li><b>Voice messages:</b> audio you send is processed to produce a translation. Support requests you submit are stored so we can respond.</li>
+  <li><b>Payment records:</b> transaction status and package details. Card details are handled entirely by our payment processor and are never stored by us.</li>
+</ul>
+
+<h2>2. How we use information</h2>
+<p>We use this information solely to operate the Service: to transcribe and translate your messages, track your balance, process payments, provide support, and prevent abuse. We do not sell your data or use it for advertising.</p>
+
+<h2>3. Third-party processors</h2>
+<p>To provide the Service we share the minimum necessary data with: AI providers (OpenAI) to transcribe, translate, and synthesize speech; Telegram, through which the Service is delivered; and Paddle.com, our Merchant of Record, to process payments. Each processes data under its own terms and privacy policy.</p>
+
+<h2>4. Voice data retention</h2>
+<p>Audio is processed to generate your translation and is not retained longer than necessary to provide the result. We do not build voice profiles or use your audio to train models.</p>
+
+<h2>5. Your rights</h2>
+<p>You may request deletion of your account data at any time by contacting us. Some records (such as payment history) may be retained where required for legal or accounting purposes.</p>
+
+<h2>6. Contact</h2>
+<p>For privacy questions or data deletion requests, email <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>.</p>
+</div>
+"""
+    return HTMLResponse(content=_page("Privacy Policy", body))
 
 
 @app.post("/telegram/webhook")
