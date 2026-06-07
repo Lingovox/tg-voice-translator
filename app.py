@@ -104,6 +104,20 @@ LANGS = [
 LANG_LABELS = {code: name for name, code in LANGS}
 SUPPORTED_LANG_CODES = {code for _, code in LANGS}
 
+# Английские названия для передачи в GPT (не для отображения пользователю)
+LANG_ENGLISH_NAMES = {
+    "en": "English",
+    "ru": "Russian",
+    "uz": "Uzbek",
+    "hi": "Hindi",
+    "es": "Spanish",
+    "ka": "Georgian",
+    "ar": "Arabic",
+    "pt": "Portuguese",
+    "tr": "Turkish",
+    "kk": "Kazakh",
+}
+
 LANG_ALIASES = {
     "en": ["english", "английский", "английском", "английскую", "ingliz", "инглиш"],
     "ru": ["russian", "русский", "русском", "русскую", "russkiy", "рус"],
@@ -875,24 +889,30 @@ async def telegram_webhook(req: Request):
 
                             if setup.get("has_setup_command") and setup.get("target_lang"):
                                 target_lang = canonicalize_language_name(setup["target_lang"])
-                                stext = setup.get("message_text") or otext
+                                stext = (setup.get("message_text") or "").strip() or otext
                                 source_lang = canonicalize_language_name(detect_language_name_from_text(stext))
                                 if normalize_language_name(source_lang) == normalize_language_name(target_lang):
-                                    raise RuntimeError("Languages are the same.")
+                                    raise RuntimeError("Исходный и целевой языки совпадают / Source and target languages are the same.")
                                 u.conversation_source_lang, u.conversation_target_lang = source_lang, target_lang
+                                db.add(u)
                                 db.commit()
+                                db.refresh(u)
                                 translate_to, resolved_in = target_lang, source_lang
                                 to_translate = stext
                             else:
                                 if not source_lang or not target_lang:
-                                    raise RuntimeError("Conversation is not configured. Say 'Translate to Spanish: ...'")
+                                    raise RuntimeError(
+                                        "Сначала настрой пару языков голосом.\n"
+                                        "Say: \"Translate to Spanish: hello\""
+                                    )
                                 inc_lang = detect_language_name_from_text(otext)
                                 translate_to, resolved_in = decide_conversation_target_any(source_lang, target_lang, inc_lang)
                                 to_translate = otext
 
                             ttext = openai_translate_text(to_translate, translate_to, source_lang=resolved_in)
                         else:
-                            ttext = openai_translate_text(otext, lang_name(u.target_lang))
+                            target_lang_en = LANG_ENGLISH_NAMES.get(u.target_lang, lang_name(u.target_lang))
+                            ttext = openai_translate_text(otext, target_lang_en)
                         
                         tts = openai_tts(ttext)
                         apply_billing(db, u, b_mode, ch)
