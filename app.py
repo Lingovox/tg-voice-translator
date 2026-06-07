@@ -6,7 +6,7 @@ import hashlib
 import hmac
 import re
 from datetime import datetime
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 import requests
 
@@ -17,19 +17,21 @@ from sqlalchemy import (
     create_engine, Column, Integer, BigInteger, String, Boolean, DateTime
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.exc import IntegrityError
 
 
-# ====
+# =========================================================
 # Logging
-# ====
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("app")
+# =========================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("lingovox")
 
 
-# ====
+# =========================================================
 # Env
-# ====
+# =========================================================
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 BASE_URL = os.getenv("BASE_URL", "").strip().rstrip("/")
@@ -38,10 +40,9 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini").strip()
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
 
-NOWPAYMENTS_API_KEY = os.getenv("NOWPAYMENTS_API_KEY", "").strip()
-NOWPAYMENTS_IPN_SECRET = os.getenv("NOWPAYMENTS_IPN_SECRET", "").strip()
-
+# ---- Payments (только карта через Paddle) ----
 PADDLE_API_KEY = os.getenv("PADDLE_API_KEY", "").strip()
 PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "").strip()
 PADDLE_CLIENT_TOKEN = os.getenv("PADDLE_CLIENT_TOKEN", "").strip()
@@ -56,20 +57,20 @@ TRIAL_LIMIT = int(os.getenv("TRIAL_LIMIT", "5"))
 TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "60"))
 MIN_BILLABLE_SECONDS = int(os.getenv("MIN_BILLABLE_SECONDS", "1"))
 
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "90"))
 
-# ====
-# Constants
-# ====
+
+# =========================================================
+# Startup validation
+# =========================================================
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is missing")
-
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN is missing")
 
 TG_API = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+TG_FILE_API = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}"
 
-NP_CREATE_INVOICE_URL = "https://api.nowpayments.io/v1/invoice"
-POSTBACK_PATH = "/payments/nowpayments"
 PADDLE_POSTBACK_PATH = "/payments/paddle"
 
 PADDLE_API_BASE = "https://api.paddle.com" if PADDLE_ENV == "live" else "https://sandbox-api.paddle.com"
@@ -88,6 +89,10 @@ PACKAGES = {
     "P600": {"usd": 70, "minutes": 600},
 }
 
+
+# =========================================================
+# Languages  (НЕ ТРОГАЕМ)
+# =========================================================
 LANGS = [
     ("English", "en"),
     ("Русский", "ru"),
@@ -117,7 +122,9 @@ LANG_ALIASES = {
     "kk": ["kazakh", "казахский", "казахском", "казахскую", "қазақша"],
 }
 
-_LANGUAGE_CANON_CACHE: Dict[str, str] = {}
+
+def lang_name(code: str) -> str:
+    return LANG_LABELS.get((code or "").strip().lower(), (code or "").strip() or "unknown")
 
 
 def find_language_code_in_text(text: str) -> str:
@@ -126,7 +133,7 @@ def find_language_code_in_text(text: str) -> str:
         return ""
     for code, aliases in LANG_ALIASES.items():
         for alias in aliases:
-            if alias in low:
+            if alias and alias in low:
                 return code
     return ""
 
@@ -141,262 +148,9 @@ def normalize_lang_code(value: str) -> str:
     return find_language_code_in_text(raw)
 
 
-def resolve_source_language(text: str, detected_lang: str, telegram_lang: str, prefer_text: bool = False) -> str:
-    detected = normalize_lang_code(detected_lang)
-    detected_from_text = ""
-    try:
-        detected_from_text = normalize_lang_code(detect_language_from_text(text))
-    except Exception:
-        detected_from_text = ""
-    if prefer_text:
-        if detected_from_text:
-            return detected_from_text
-        if detected:
-            return detected
-    else:
-        if detected:
-            return detected
-        if detected_from_text:
-            return detected_from_text
-    return normalize_lang_code(telegram_lang)
-
-
-def decide_conversation_target(source_lang: str, target_lang: str, incoming_lang: str, telegram_lang: str) -> Tuple[str, str]:
-    source_lang = normalize_lang_code(source_lang)
-    target_lang = normalize_lang_code(target_lang)
-    incoming_lang = normalize_lang_code(incoming_lang)
-    telegram_lang = normalize_lang_code(telegram_lang)
-    if incoming_lang == source_lang:
-        return target_lang, incoming_lang
-    if incoming_lang == target_lang:
-        return source_lang, incoming_lang
-    if not incoming_lang and telegram_lang == source_lang:
-        return target_lang, telegram_lang
-    if not incoming_lang and telegram_lang == target_lang:
-        return source_lang, telegram_lang
-    if incoming_lang and incoming_lang not in {source_lang, target_lang}:
-        if telegram_lang == source_lang:
-            return target_lang, source_lang
-        if telegram_lang == target_lang:
-            return source_lang, target_lang
-        raise RuntimeError(
-            f"Detected language '{lang_name(incoming_lang)}' is outside this conversation: "
-            f"{lang_name(source_lang)} ↔ {lang_name(target_lang)}"
-        )
-    if telegram_lang == source_lang:
-        return target_lang, source_lang
-    if telegram_lang == target_lang:
-        return source_lang, target_lang
-    raise RuntimeError(
-        f"Could not determine translation direction for conversation: "
-        f"{lang_name(source_lang)} ↔ {lang_name(target_lang)}"
-    )
-
-
-def parse_conversation_setup_local(text: str) -> Dict[str, str]:
-    original = (text or "").strip()
-    low = original.lower()
-    has_setup_command = any(cmd in low for cmd in [
-        "translate to", "translate into", "переведи на", "перевести на",
-        "übersetze auf", "übersetze ins", "übersetze in", "translate", "переведи", "перевести"
-    ])
-    target_lang = ""
-    message_text = original
-    patterns = [
-        r"^\s*переведи\s+на\s+(.+?)(?:\s+язык)?[,:;\.\!\?\-]\s*(.+)$",
-        r"^\s*перевести\s+на\s+(.+?)(?:\s+язык)?[,:;\.\!\?\-]\s*(.+)$",
-        r"^\s*translate\s+(?:to|into)\s+(.+?)[,:;\.\!\?\-]\s*(.+)$",
-        r"^\s*übersetze\s+(?:auf|ins?|in)\s+(.+?)[,:;\.\!\?\-]\s*(.+)$",
-    ]
-    for pattern in patterns:
-        m = re.match(pattern, original, flags=re.IGNORECASE)
-        if m:
-            target_lang = m.group(1).strip().strip(" -–—")
-            message_text = m.group(2).strip()
-            break
-    return {
-        "target_lang": target_lang,
-        "message_text": (message_text or "").strip(),
-        "has_setup_command": has_setup_command,
-    }
-
-
-def normalize_language_name(value: str) -> str:
-    return re.sub(r"\s+", " ", (value or "").strip().lower())
-
-
-def detect_language_name_from_text(text: str) -> str:
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = _openai_headers()
-    headers["Content-Type"] = "application/json"
-    prompt = (
-        "Detect the language of the text. "
-        "Return only JSON like {\"language\":\"Russian\"}. "
-        "Use a plain English language name, not a code.\n\n"
-        f"Text:\n{text}"
-    )
-    payload = {
-        "model": OPENAI_TEXT_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"}
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"OpenAI language detect failed: HTTP {r.status_code}")
-    out = r.json()["choices"][0]["message"]["content"]
-    try:
-        parsed = json.loads(out)
-    except Exception:
-        parsed = {}
-    language = str(parsed.get("language") or "").strip()
-    if not language:
-        raise RuntimeError("Could not detect source language")
-    return language
-
-
-def parse_conversation_setup(text: str) -> Dict[str, str]:
-    local = parse_conversation_setup_local(text)
-    if local.get("target_lang") and local.get("message_text") and local.get("has_setup_command"):
-        return local
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = _openai_headers()
-    headers["Content-Type"] = "application/json"
-    prompt = (
-        "Extract conversation setup from the user's first phrase for a voice translation bot. "
-        "The user may say things like 'translate to Spanish: hello', 'переведи на таджикский язык. привет', "
-        "or similar phrases in any language. "
-        "Return only JSON with keys target_lang, message_text, has_setup_command. "
-        "target_lang must be a plain English language name like Spanish, Tajik, Uzbek, Kazakh, Arabic, Japanese, etc. "
-        "Do not return a language code. "
-        "If the target language is unclear, return target_lang as an empty string. "
-        "message_text must contain only the part that should actually be translated, without the command.\n\n"
-        f"Text:\n{text}"
-    )
-    payload = {
-        "model": OPENAI_TEXT_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"}
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"OpenAI conversation setup parse failed: HTTP {r.status_code}")
-    out = r.json()["choices"][0]["message"]["content"]
-    try:
-        parsed = json.loads(out)
-    except Exception:
-        parsed = {}
-    target_lang = str(parsed.get("target_lang") or "").strip()
-    message_text = str(parsed.get("message_text") or "").strip()
-    has_setup_command = bool(parsed.get("has_setup_command"))
-    if not target_lang:
-        target_lang = local.get("target_lang", "")
-    if not message_text:
-        message_text = local.get("message_text", "")
-    return {
-        "target_lang": target_lang,
-        "message_text": message_text,
-        "has_setup_command": has_setup_command or bool(local.get("has_setup_command")),
-    }
-
-
-def canonicalize_language_name(value: str) -> str:
-    raw = (value or "").strip()
-    if not raw:
-        return ""
-    key = normalize_language_name(raw)
-    cached = _LANGUAGE_CANON_CACHE.get(key)
-    if cached:
-        return cached
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = _openai_headers()
-    headers["Content-Type"] = "application/json"
-    prompt = (
-        "Normalize the following language reference to a canonical plain English language name. "
-        "Examples: 'таджикский' -> 'Tajik', 'Тоҷикӣ' -> 'Tajik', 'русский' -> 'Russian', 'espanol' -> 'Spanish'. "
-        "Return only JSON like {\"language\":\"Tajik\"}.\n\n"
-        f"Language reference:\n{raw}"
-    )
-    payload = {
-        "model": OPENAI_TEXT_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"}
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"OpenAI language normalization failed: HTTP {r.status_code}")
-    out = r.json()["choices"][0]["message"]["content"]
-    try:
-        parsed = json.loads(out)
-    except Exception:
-        parsed = {}
-    language = str(parsed.get("language") or "").strip()
-    if not language:
-        language = raw
-    _LANGUAGE_CANON_CACHE[key] = language
-    return language
-
-
-def choose_language_in_pair(source_lang: str, target_lang: str, incoming_lang: str) -> str:
-    source_canonical = canonicalize_language_name(source_lang)
-    target_canonical = canonicalize_language_name(target_lang)
-    incoming_canonical = canonicalize_language_name(incoming_lang)
-    src = normalize_language_name(source_canonical)
-    tgt = normalize_language_name(target_canonical)
-    inc = normalize_language_name(incoming_canonical)
-    if inc == src:
-        return source_canonical
-    if inc == tgt:
-        return target_canonical
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = _openai_headers()
-    headers["Content-Type"] = "application/json"
-    prompt = (
-        "You are matching a detected language to one side of an active two-language conversation. "
-        "Return only JSON like {\"match\":\"source\"} or {\"match\":\"target\"} or {\"match\":\"unknown\"}.\n\n"
-        f"Source language: {source_canonical}\n"
-        f"Target language: {target_canonical}\n"
-        f"Detected incoming language: {incoming_canonical}\n"
-    )
-    payload = {
-        "model": OPENAI_TEXT_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"}
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"OpenAI conversation match failed: HTTP {r.status_code}")
-    out = r.json()["choices"][0]["message"]["content"]
-    try:
-        parsed = json.loads(out)
-    except Exception:
-        parsed = {}
-    match = str(parsed.get("match") or "").strip().lower()
-    if match == "source":
-        return source_canonical
-    if match == "target":
-        return target_canonical
-    raise RuntimeError(
-        f"Detected language '{incoming_canonical}' is outside this conversation: "
-        f"{source_canonical} ↔ {target_canonical}"
-    )
-
-
-def decide_conversation_target_any(source_lang: str, target_lang: str, incoming_lang: str) -> Tuple[str, str]:
-    source_canonical = canonicalize_language_name(source_lang)
-    target_canonical = canonicalize_language_name(target_lang)
-    matched_side = choose_language_in_pair(source_canonical, target_canonical, incoming_lang)
-    if normalize_language_name(matched_side) == normalize_language_name(source_canonical):
-        return target_canonical, source_canonical
-    return source_canonical, target_canonical
-
-
-def lang_name(code: str) -> str:
-    return LANG_LABELS.get((code or "").strip().lower(), (code or "").strip().lower() or "unknown")
-
-
-# ====
+# =========================================================
 # DB
-# ====
+# =========================================================
 engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 Base = declarative_base()
@@ -411,6 +165,7 @@ class User(Base):
     balance_seconds = Column(Integer, nullable=False, default=0)
     is_subscribed = Column(Boolean, nullable=False, default=False)
     mode = Column(String, nullable=False, default="translate")
+    # В режиме conversation храним коды языков из списка LANGS
     conversation_source_lang = Column(String, nullable=True)
     conversation_target_lang = Column(String, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -422,11 +177,11 @@ class Payment(Base):
     id = Column(Integer, primary_key=True, index=True)
     telegram_id = Column(BigInteger, nullable=False, index=True)
     order_id = Column(String, nullable=False, unique=True, index=True)
-    invoice_id = Column(String, nullable=False, unique=True, index=True)
+    invoice_id = Column(String, nullable=False, default="")
     package_code = Column(String, nullable=False)
     amount_usd = Column(Integer, nullable=False)
-    provider = Column(String, nullable=False, default="nowpayments")
-    external_id = Column(String, nullable=True, unique=True)
+    provider = Column(String, nullable=False, default="paddle")
+    external_id = Column(String, nullable=True)
     status = Column(String, nullable=False, default="created")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
@@ -448,52 +203,65 @@ def init_db():
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS mode VARCHAR DEFAULT 'translate'")
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS conversation_source_lang VARCHAR")
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS conversation_target_lang VARCHAR")
-        conn.exec_driver_sql("ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider VARCHAR DEFAULT 'nowpayments'")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_messages INTEGER DEFAULT 0")
+        conn.exec_driver_sql("ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider VARCHAR DEFAULT 'paddle'")
         conn.exec_driver_sql("ALTER TABLE payments ADD COLUMN IF NOT EXISTS external_id VARCHAR")
 
 
-# ====
+# =========================================================
 # Telegram helpers
-# ====
+# =========================================================
 def tg_request(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{TG_API}/{method}"
-    r = requests.post(url, json=payload, timeout=30)
     try:
-        data = r.json()
-    except Exception:
-        return {"ok": False, "raw": r.text, "status": r.status_code}
-    return data
+        r = requests.post(f"{TG_API}/{method}", json=payload, timeout=30)
+        return r.json()
+    except Exception as e:
+        log.warning("Telegram %s failed: %s", method, e)
+        return {"ok": False, "error": str(e)}
 
 
-def tg_send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None):
-    payload = {"chat_id": chat_id, "text": text}
+def tg_send_message(chat_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"chat_id": chat_id, "text": text}
     if reply_markup:
         payload["reply_markup"] = reply_markup
     return tg_request("sendMessage", payload)
 
 
-def tg_send_voice(chat_id: int, voice_bytes: bytes, caption: Optional[str] = None):
-    url = f"{TG_API}/sendVoice"
+def tg_send_voice(chat_id: int, voice_bytes: bytes, caption: Optional[str] = None) -> Dict[str, Any]:
     files = {"voice": ("voice.ogg", voice_bytes, "audio/ogg")}
     data = {"chat_id": str(chat_id)}
     if caption:
         data["caption"] = caption
-    r = requests.post(url, data=data, files=files, timeout=60)
     try:
+        r = requests.post(f"{TG_API}/sendVoice", data=data, files=files, timeout=120)
         return r.json()
-    except Exception:
-        return {"ok": False, "raw": r.text, "status": r.status_code}
+    except Exception as e:
+        log.warning("sendVoice failed: %s", e)
+        return {"ok": False, "error": str(e)}
 
 
-def tg_answer_callback(callback_query_id: str, text: Optional[str] = None):
-    payload = {"callback_query_id": callback_query_id}
+def tg_answer_callback(callback_query_id: str, text: Optional[str] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"callback_query_id": callback_query_id}
     if text:
         payload["text"] = text
     return tg_request("answerCallbackQuery", payload)
 
 
+def tg_download_voice(file_id: str) -> bytes:
+    gf = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=30).json()
+    if not gf.get("ok"):
+        raise RuntimeError("Could not resolve voice file")
+    file_path = gf["result"]["file_path"]
+    audio = requests.get(f"{TG_FILE_API}/{file_path}", timeout=60)
+    audio.raise_for_status()
+    return audio.content
+
+
+# =========================================================
+# Keyboards
+# =========================================================
 def build_main_keyboard(selected_lang: str, mode: str = "translate", conversation_ready: bool = False) -> Dict[str, Any]:
-    rows = []
+    rows: List[List[Dict[str, str]]] = []
     mode_prefix = "✅ " if mode == "conversation" else ""
     rows.append([{"text": f"{mode_prefix}🗣 Conversation", "callback_data": "mode:conversation"}])
     for i in range(0, len(LANGS), 2):
@@ -517,102 +285,225 @@ def build_packages_keyboard() -> Dict[str, Any]:
             [{"text": "💳 Card — 60 min — $15", "callback_data": "paddle:P60"}],
             [{"text": "💳 Card — 180 min — $30", "callback_data": "paddle:P180"}],
             [{"text": "💳 Card — 600 min — $70", "callback_data": "paddle:P600"}],
-            [{"text": "💎 Crypto — 30 min — $10", "callback_data": "buy:P30"}],
-            [{"text": "💎 Crypto — 60 min — $15", "callback_data": "buy:P60"}],
-            [{"text": "💎 Crypto — 180 min — $30", "callback_data": "buy:P180"}],
-            [{"text": "💎 Crypto — 600 min — $70", "callback_data": "buy:P600"}],
             [{"text": "⬅️ Back", "callback_data": "buy:back"}],
         ]
     }
 
 
-def format_status_text(user: User) -> str:
+def user_keyboard(user: "User") -> Dict[str, Any]:
+    return build_main_keyboard(
+        user.target_lang,
+        mode=(user.mode or "translate"),
+        conversation_ready=bool(user.conversation_source_lang and user.conversation_target_lang),
+    )
+
+
+def format_status_text(user: "User") -> str:
     bal_min = max(0, int(user.balance_seconds or 0)) // 60
     if (user.mode or "translate") == "conversation":
         if user.conversation_source_lang and user.conversation_target_lang:
             conversation_line = (
-                f"🗣 Conversation: {user.conversation_source_lang} ↔ {user.conversation_target_lang}\n"
-                "Send voice messages from either side.\n"
+                f"🗣 Conversation: {lang_name(user.conversation_source_lang)} ↔ "
+                f"{lang_name(user.conversation_target_lang)}\n"
+                "Send voice from either side — I auto-detect and translate.\n"
             )
         else:
             conversation_line = (
                 "🗣 Conversation mode is on\n"
-                "Start with a phrase like: 'Translate to Spanish: hello, how are you?'\n"
+                "Start with a phrase like: \"Translate to Spanish: hello, how are you?\"\n"
             )
         return (
             "🎙 Lingovox — AI live conversation\n\n"
             f"{conversation_line}"
             f"🎁 Free messages left: {user.trial_left} (≤ {TRIAL_MAX_SECONDS}s)\n"
             f"💳 Balance: {bal_min} min\n\n"
-            "Bot remembers the pair of languages from your voice command and then translates in both directions."
+            "I remember the language pair from your command and translate in both directions."
         )
     return (
         "🎙 Lingovox — AI voice translator\n\n"
         f"🌍 Target language: {lang_name(user.target_lang)}\n"
         f"🎁 Free messages left: {user.trial_left} (≤ {TRIAL_MAX_SECONDS}s)\n"
         f"💳 Balance: {bal_min} min\n\n"
-        "Send a voice message — I'll translate and reply with voice."
+        "Send a voice message — I'll translate it and reply with voice."
     )
 
 
-# ====
-# NOWPayments helpers
-# ====
-def env_missing() -> list:
-    missing = []
-    if not NOWPAYMENTS_API_KEY: missing.append("NOWPAYMENTS_API_KEY")
-    if not NOWPAYMENTS_IPN_SECRET: missing.append("NOWPAYMENTS_IPN_SECRET")
-    if not BASE_URL: missing.append("BASE_URL")
-    return missing
+# =========================================================
+# OpenAI helpers
+# =========================================================
+def _openai_headers() -> Dict[str, str]:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY missing")
+    return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
 
 
-def nowpayments_create_invoice(order_id: str, amount_usd: int, description: str) -> Dict[str, Any]:
-    headers = {"x-api-key": NOWPAYMENTS_API_KEY, "Content-Type": "application/json"}
-    payload = {
-        "price_amount": amount_usd, "price_currency": "usd", "pay_currency": "usdttrc20",
-        "order_id": order_id, "order_description": description,
-        "ipn_callback_url": f"{BASE_URL}{POSTBACK_PATH}",
-        "success_url": f"{BASE_URL}/", "cancel_url": f"{BASE_URL}/",
-        "is_fixed_rate": False, "is_fee_paid_by_user": False,
+def _openai_post(url: str, *, json_body: Dict[str, Any], timeout: int = REQUEST_TIMEOUT) -> requests.Response:
+    headers = _openai_headers()
+    headers["Content-Type"] = "application/json"
+    last_err = None
+    for attempt in range(2):
+        try:
+            r = requests.post(url, headers=headers, json=json_body, timeout=timeout)
+            if r.status_code == 200:
+                return r
+            last_err = f"HTTP {r.status_code}: {r.text[:300]}"
+        except Exception as e:
+            last_err = str(e)
+        time.sleep(1.0 * (attempt + 1))
+    raise RuntimeError(f"OpenAI request failed: {last_err}")
+
+
+def openai_transcribe(ogg_bytes: bytes) -> str:
+    url = "https://api.openai.com/v1/audio/transcriptions"
+    files = {
+        "file": ("audio.ogg", ogg_bytes, "audio/ogg"),
+        "model": (None, "whisper-1"),
+        "response_format": (None, "json"),
     }
-    r = requests.post(NP_CREATE_INVOICE_URL, headers=headers, json=payload, timeout=30)
-    if "application/json" not in (r.headers.get("content-type") or "").lower():
-        return {"ok": False, "status": r.status_code, "raw": r.text}
-    return {"ok": r.status_code in (200, 201), "status": r.status_code, "data": r.json()}
+    r = requests.post(url, headers=_openai_headers(), files=files, timeout=120)
+    if r.status_code != 200:
+        raise RuntimeError(f"Transcription failed: {r.text[:300]}")
+    return str(r.json().get("text") or "").strip()
 
 
-def verify_nowpayments_signature(raw_body: bytes, signature: str) -> bool:
-    if not NOWPAYMENTS_IPN_SECRET or not signature: return False
-    calc = hmac.new(NOWPAYMENTS_IPN_SECRET.encode("utf-8"), raw_body, hashlib.sha512).hexdigest()
-    return hmac.compare_digest(calc, signature)
+def openai_tts(text: str) -> bytes:
+    url = "https://api.openai.com/v1/audio/speech"
+    body = {"model": "tts-1", "voice": OPENAI_TTS_VOICE, "format": "ogg", "input": text}
+    r = _openai_post(url, json_body=body, timeout=120)
+    return r.content
 
 
+def openai_translate_text(text: str, target_lang: str, source_lang: Optional[str] = None) -> str:
+    url = "https://api.openai.com/v1/chat/completions"
+    src = f"from {source_lang} " if source_lang else ""
+    prompt = (
+        f"Translate the following text {src}to {target_lang}. "
+        "Keep the tone natural and conversational. Return ONLY the translation, no notes.\n\n"
+        f"Text:\n{text}"
+    )
+    body = {"model": OPENAI_TEXT_MODEL, "messages": [{"role": "user", "content": prompt}]}
+    r = _openai_post(url, json_body=body)
+    return r.json()["choices"][0]["message"]["content"].strip()
+
+
+def detect_language_code(text: str) -> str:
+    """Определяет язык текста и возвращает код из SUPPORTED_LANG_CODES (или '')."""
+    local = find_language_code_in_text(text)
+    if local:
+        return local
+    url = "https://api.openai.com/v1/chat/completions"
+    codes = ", ".join(sorted(SUPPORTED_LANG_CODES))
+    prompt = (
+        f"Detect the language of the text. Return ONLY JSON like {{\"language\":\"ru\"}} "
+        f"using one of these codes: {codes}. If none fit, use the closest.\n\nText:\n{text}"
+    )
+    body = {
+        "model": OPENAI_TEXT_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+    }
+    r = _openai_post(url, json_body=body, timeout=60)
+    try:
+        out = json.loads(r.json()["choices"][0]["message"]["content"])
+        return normalize_lang_code(str(out.get("language") or ""))
+    except Exception:
+        return ""
+
+
+# =========================================================
+# Conversation setup parsing
+# =========================================================
+SETUP_PATTERNS = [
+    r"^\s*переведи\s+на\s+(.+?)(?:\s+язык)?\s*[,:;\.\!\?\-]\s*(.+)$",
+    r"^\s*перевести\s+на\s+(.+?)(?:\s+язык)?\s*[,:;\.\!\?\-]\s*(.+)$",
+    r"^\s*translate\s+(?:to|into)\s+(.+?)\s*[,:;\.\!\?\-]\s*(.+)$",
+    r"^\s*übersetze\s+(?:auf|ins?|in)\s+(.+?)\s*[,:;\.\!\?\-]\s*(.+)$",
+]
+
+
+def parse_conversation_setup(text: str) -> Dict[str, Any]:
+    """
+    Пытается распознать команду вида 'Translate to Spanish: hello'.
+    Возвращает target_code (код языка из LANGS или ''), message_text, has_command.
+    """
+    original = (text or "").strip()
+    low = original.lower()
+    has_command = any(c in low for c in [
+        "translate to", "translate into", "переведи на", "перевести на",
+        "übersetze auf", "übersetze ins", "übersetze in",
+    ])
+    target_raw = ""
+    message_text = original
+    for pattern in SETUP_PATTERNS:
+        m = re.match(pattern, original, flags=re.IGNORECASE)
+        if m:
+            target_raw = m.group(1).strip(" -–—")
+            message_text = m.group(2).strip()
+            break
+    target_code = normalize_lang_code(target_raw) if target_raw else ""
+    return {
+        "target_code": target_code,
+        "message_text": message_text,
+        "has_command": has_command,
+    }
+
+
+def resolve_conversation_direction(source_code: str, target_code: str, incoming_code: str) -> Tuple[str, str]:
+    """
+    По входящему языку решает, на какой язык переводить.
+    Возвращает (translate_to_code, detected_from_code).
+    """
+    source_code = normalize_lang_code(source_code)
+    target_code = normalize_lang_code(target_code)
+    incoming_code = normalize_lang_code(incoming_code)
+
+    if incoming_code == source_code:
+        return target_code, source_code
+    if incoming_code == target_code:
+        return source_code, target_code
+    # Не удалось точно сопоставить — по умолчанию считаем, что говорят на source
+    if incoming_code:
+        return target_code, incoming_code
+    return target_code, source_code
+
+
+# =========================================================
+# Payments — Paddle (card only)
+# =========================================================
 def paddle_env_missing() -> list:
     missing = []
-    if not PADDLE_API_KEY: missing.append("PADDLE_API_KEY")
-    if not PADDLE_WEBHOOK_SECRET: missing.append("PADDLE_WEBHOOK_SECRET")
-    if not BASE_URL: missing.append("BASE_URL")
+    if not PADDLE_API_KEY:
+        missing.append("PADDLE_API_KEY")
+    if not PADDLE_WEBHOOK_SECRET:
+        missing.append("PADDLE_WEBHOOK_SECRET")
+    if not BASE_URL:
+        missing.append("BASE_URL")
     return missing
 
 
 def paddle_headers() -> Dict[str, str]:
-    if not PADDLE_API_KEY: raise RuntimeError("PADDLE_API_KEY missing")
+    if not PADDLE_API_KEY:
+        raise RuntimeError("PADDLE_API_KEY missing")
     return {"Authorization": f"Bearer {PADDLE_API_KEY}", "Content-Type": "application/json"}
 
 
 def verify_paddle_signature(raw_body: bytes, sig_header: str, tolerance: int = 300) -> bool:
-    if not PADDLE_WEBHOOK_SECRET or not sig_header: return False
-    pairs = {}
+    if not PADDLE_WEBHOOK_SECRET or not sig_header:
+        return False
+    pairs: Dict[str, list] = {}
     for pt in sig_header.split(";"):
         if "=" in pt:
             k, v = pt.split("=", 1)
             pairs.setdefault(k.strip(), []).append(v.strip())
     ts = (pairs.get("ts") or [None])[0]
     sigs = pairs.get("h1") or []
-    if not ts or not sigs: return False
+    if not ts or not sigs:
+        return False
     try:
-        if abs(time.time() - int(ts)) > tolerance: return False
-    except: return False
+        if abs(time.time() - int(ts)) > tolerance:
+            return False
+    except Exception:
+        return False
     signed = ts.encode("utf-8") + b":" + raw_body
     expected = hmac.new(PADDLE_WEBHOOK_SECRET.encode("utf-8"), signed, hashlib.sha256).hexdigest()
     return any(hmac.compare_digest(expected, s) for s in sigs)
@@ -620,7 +511,8 @@ def verify_paddle_signature(raw_body: bytes, sig_header: str, tolerance: int = 3
 
 def paddle_create_transaction(package_code: str, telegram_id: int) -> Dict[str, Any]:
     price_id = (PADDLE_PRICES.get(package_code) or "").strip()
-    if not price_id: raise RuntimeError(f"Paddle price not set for {package_code}")
+    if not price_id:
+        raise RuntimeError(f"Paddle price not set for {package_code}")
     oid = f"pdl_{telegram_id}_{package_code}_{int(time.time())}"
     payload = {
         "items": [{"price_id": price_id, "quantity": 1}],
@@ -633,307 +525,387 @@ def paddle_create_transaction(package_code: str, telegram_id: int) -> Dict[str, 
     return {"ok": r.status_code in (200, 201), "status": r.status_code, "data": r.json(), "order_id": oid}
 
 
-def credit_payment_if_needed(db, payment: Payment) -> bool:
-    if (payment.status or "").lower() == "paid": return False
+def credit_payment_if_needed(db, payment: "Payment") -> bool:
+    if (payment.status or "").lower() == "paid":
+        return False
     pkg = PACKAGES.get(payment.package_code)
-    if not pkg: return False
+    if not pkg:
+        return False
     user = ensure_user(db, int(payment.telegram_id))
     user.balance_seconds = max(0, int(user.balance_seconds or 0) + int(pkg["minutes"] * 60))
     user.updated_at = datetime.utcnow()
     payment.status = "paid"
     payment.updated_at = datetime.utcnow()
-    db.add(user); db.add(payment); db.commit(); db.refresh(user)
-    tg_send_message(int(user.telegram_id), f"✅ Payment received!\nCredited: {pkg['minutes']} min", reply_markup=user_keyboard(user))
+    db.add(user)
+    db.add(payment)
+    db.commit()
+    db.refresh(user)
+    tg_send_message(
+        int(user.telegram_id),
+        f"✅ Payment received!\nCredited: {pkg['minutes']} min",
+        reply_markup=user_keyboard(user),
+    )
     return True
 
 
-# ====
-# OpenAI helpers
-# ====
-def _openai_headers() -> Dict[str, str]:
-    if not OPENAI_API_KEY: raise RuntimeError("OPENAI_API_KEY missing")
-    return {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+# =========================================================
+# Payment callback handlers (создание инвойсов)
+# =========================================================
+def handle_card_purchase(db, chat_id: int, package_code: str) -> None:
+    pkg = PACKAGES.get(package_code)
+    if not pkg:
+        tg_send_message(chat_id, "⚠️ Unknown package.")
+        return
+    missing = paddle_env_missing()
+    if missing:
+        tg_send_message(chat_id, f"⚠️ Card payments are not configured: {', '.join(missing)}")
+        return
+    try:
+        res = paddle_create_transaction(package_code, chat_id)
+    except Exception as e:
+        log.warning("Paddle transaction error: %s", e)
+        tg_send_message(chat_id, "⚠️ Could not create card checkout. Try again later.")
+        return
+    if not res.get("ok"):
+        log.warning("Paddle transaction failed: %s", res)
+        tg_send_message(chat_id, "⚠️ Could not create card checkout. Try again later.")
+        return
+    tx = (res.get("data") or {}).get("data") or {}
+    tx_id = str(tx.get("id") or "")
+    checkout = (tx.get("checkout") or {}).get("url") or ""
+    p = Payment(
+        telegram_id=chat_id, order_id=res.get("order_id", f"pdl_{chat_id}_{int(time.time())}"),
+        invoice_id=tx_id, package_code=package_code, amount_usd=int(pkg["usd"]),
+        provider="paddle", external_id=tx_id, status="created",
+    )
+    db.add(p)
+    db.commit()
+    if checkout:
+        tg_send_message(chat_id, f"💳 Pay with card:\n{checkout}")
+    else:
+        tg_send_message(chat_id, "⚠️ Checkout created but no link returned.")
 
 
-def openai_transcribe_verbose(ogg_bytes: bytes) -> Dict[str, Any]:
-    url = "https://api.openai.com/v1/audio/transcriptions"
-    files = {"file": ("audio.ogg", ogg_bytes, "audio/ogg"), "model": (None, "whisper-1"), "response_format": (None, "json")}
-    r = requests.post(url, headers=_openai_headers(), files=files, timeout=90)
-    if r.status_code != 200: raise RuntimeError(f"Transcription failed: {r.text}")
-    data = r.json()
-    return {"text": str(data.get("text") or "").strip()}
-
-
-def openai_tts(text: str) -> bytes:
-    url = "https://api.openai.com/v1/audio/speech"
-    p = {"model": "tts-1", "voice": "alloy", "format": "ogg", "input": text}
-    r = requests.post(url, headers=_openai_headers(), json=p, timeout=90)
-    if r.status_code != 200: raise RuntimeError(f"TTS failed: {r.text}")
-    return r.content
-
-
-def openai_translate_text(text: str, target_lang: str, source_lang: Optional[str] = None) -> str:
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = _openai_headers()
-    headers["Content-Type"] = "application/json"
-    sl = f"from {source_lang} " if source_lang else ""
-    prompt = f"Translate the following text {sl}to {target_lang}. Return only the translation.\n\nText:\n{text}"
-    payload = {"model": OPENAI_TEXT_MODEL, "messages": [{"role": "user", "content": prompt}]}
-    r = requests.post(url, headers=headers, json=payload, timeout=90)
-    if r.status_code != 200: raise RuntimeError(f"Translation failed: {r.text}")
-    return r.json()["choices"][0]["message"]["content"].strip()
-
-
-def detect_language_from_text(text: str) -> str:
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = _openai_headers()
-    headers["Content-Type"] = "application/json"
-    codes = ", ".join(sorted(SUPPORTED_LANG_CODES))
-    prompt = f"Detect language. Return only JSON like {{\"language\":\"ru\"}} from this list: {codes}.\n\nText:\n{text}"
-    payload = {
-        "model": OPENAI_TEXT_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "response_format": {"type": "json_object"}
-    }
-    r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200: raise RuntimeError(f"Detect failed: {r.text}")
-    out = r.json()["choices"][0]["message"]["content"]
-    language = json.loads(out).get("language", "").strip().lower()
-    if language not in SUPPORTED_LANG_CODES: raise RuntimeError("Unsupported language detected")
-    return language
-
-
-# ====
+# =========================================================
 # Logic helpers
-# ====
-def ensure_user(db, chat_id: int) -> User:
+# =========================================================
+def ensure_user(db, chat_id: int) -> "User":
     u = db.get(User, int(chat_id))
     if not u:
         u = User(telegram_id=int(chat_id), target_lang="en", trial_left=TRIAL_LIMIT, mode="translate")
-        db.add(u); db.commit(); db.refresh(u)
+        db.add(u)
+        db.commit()
+        db.refresh(u)
     return u
 
 
-def user_keyboard(user: User) -> Dict[str, Any]:
-    return build_main_keyboard(
-        user.target_lang,
-        mode=(user.mode or "translate"),
-        conversation_ready=bool(user.conversation_source_lang and user.conversation_target_lang)
-    )
-
-
-def decide_billing(user: User, voice_seconds: int) -> Tuple[str, int]:
+def decide_billing(user: "User", voice_seconds: int) -> Tuple[str, int]:
     sec = max(MIN_BILLABLE_SECONDS, int(voice_seconds))
-    if (user.trial_left or 0) > 0 and sec <= TRIAL_MAX_SECONDS: return "trial", 0
-    if int(user.balance_seconds or 0) >= sec: return "paid", sec
+    if (user.trial_left or 0) > 0 and sec <= TRIAL_MAX_SECONDS:
+        return "trial", 0
+    if int(user.balance_seconds or 0) >= sec:
+        return "paid", sec
     return "deny", 0
 
 
-def apply_billing(db, user: User, mode: str, charge: int):
-    if mode == "trial": user.trial_left = max(0, int(user.trial_left or 0) - 1)
-    elif mode == "paid": user.balance_seconds = max(0, int(user.balance_seconds or 0) - charge)
+def apply_billing(db, user: "User", mode: str, charge: int) -> None:
+    if mode == "trial":
+        user.trial_left = max(0, int(user.trial_left or 0) - 1)
+    elif mode == "paid":
+        user.balance_seconds = max(0, int(user.balance_seconds or 0) - charge)
     user.updated_at = datetime.utcnow()
     db.add(user)
 
 
 def is_admin(chat_id: int) -> bool:
-    return str(chat_id) == str(ADMIN_ID) and ADMIN_ID != ""
+    return ADMIN_ID != "" and str(chat_id) == str(ADMIN_ID)
 
 
-def admin_notify(text: str):
+def admin_notify(text: str) -> None:
     if ADMIN_ID:
-        try: tg_send_message(int(ADMIN_ID), text)
-        except: pass
+        try:
+            tg_send_message(int(ADMIN_ID), text)
+        except Exception:
+            pass
 
 
-# ====
+# =========================================================
+# Voice processing
+# =========================================================
+def process_voice(db, user: "User", chat_id: int, file_id: str, duration: int) -> None:
+    b_mode, charge = decide_billing(user, duration)
+    if b_mode == "deny":
+        tg_send_message(chat_id, "⛔ Not enough balance. Tap “Buy minutes”.", reply_markup=user_keyboard(user))
+        return
+
+    audio = tg_download_voice(file_id)
+    transcript = openai_transcribe(audio)
+    if not transcript:
+        raise RuntimeError("Empty voice message")
+
+    if (user.mode or "translate") == "conversation":
+        translated, used_caption = _process_conversation_voice(db, user, transcript)
+    else:
+        translated = openai_translate_text(transcript, lang_name(user.target_lang))
+        used_caption = None
+
+    tts = openai_tts(translated)
+    apply_billing(db, user, b_mode, charge)
+    db.commit()
+
+    if b_mode == "trial":
+        cap = f"🎁 Trial left: {user.trial_left}"
+    else:
+        cap = f"💳 Balance: {user.balance_seconds // 60} min"
+    if used_caption:
+        cap = f"{used_caption}\n{cap}"
+
+    tg_send_voice(chat_id, tts, caption=cap)
+    tg_send_message(chat_id, format_status_text(user), reply_markup=user_keyboard(user))
+
+
+def _process_conversation_voice(db, user: "User", transcript: str) -> Tuple[str, Optional[str]]:
+    source_code = (user.conversation_source_lang or "").strip()
+    target_code = (user.conversation_target_lang or "").strip()
+    setup = parse_conversation_setup(transcript)
+
+    # Команда настройки пары языков
+    if setup["has_command"] and setup["target_code"]:
+        new_target = setup["target_code"]
+        msg = setup["message_text"] or transcript
+        new_source = detect_language_code(msg)
+        if not new_source or new_source == new_target:
+            # подстрахуемся дефолтом, если детект совпал/пуст
+            new_source = "en" if new_target != "en" else "ru"
+        user.conversation_source_lang = new_source
+        user.conversation_target_lang = new_target
+        db.commit()
+        translated = openai_translate_text(msg, lang_name(new_target), source_lang=lang_name(new_source))
+        caption = f"🗣 {lang_name(new_source)} → {lang_name(new_target)}"
+        return translated, caption
+
+    # Пара ещё не настроена
+    if not source_code or not target_code:
+        raise RuntimeError("Conversation not configured. Say e.g. \"Translate to Spanish: hello\"")
+
+    incoming = detect_language_code(transcript)
+    translate_to, detected_from = resolve_conversation_direction(source_code, target_code, incoming)
+    translated = openai_translate_text(
+        transcript, lang_name(translate_to), source_lang=lang_name(detected_from) if detected_from else None
+    )
+    caption = f"🗣 {lang_name(detected_from)} → {lang_name(translate_to)}"
+    return translated, caption
+
+
+# =========================================================
 # FastAPI
-# ====
-app = FastAPI()
+# =========================================================
+app = FastAPI(title="Lingovox")
 
 
 @app.on_event("startup")
-def startup(): init_db()
+def startup():
+    init_db()
+
+
+@app.get("/healthz", response_class=PlainTextResponse)
+def healthz():
+    return "ok"
 
 
 @app.get("/", response_class=HTMLResponse)
 def landing():
-    bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
-    langs = ", ".join([name for name, _ in LANGS])
-    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"/><title>Lingovox</title><style>body{{background:#0b1020;color:#e9eefc;font-family:sans-serif;padding:40px}}a{{color:#fff}}.card{{background:#111a33;padding:20px;border-radius:15px;max-width:600px;margin:auto}}</style></head><body><div class="card"><h1>Lingovox AI</h1><p>Voice translator.</p><p>Supported: {langs}</p><a href="{bot_link}">Open Bot</a></div></body></html>"""
+    bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "#"
+    langs = ", ".join(name for name, _ in LANGS)
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Lingovox</title><style>
+body{{background:#0b1020;color:#e9eefc;font-family:system-ui,sans-serif;padding:40px;margin:0}}
+a{{color:#7aa2ff}}.card{{background:#111a33;padding:28px;border-radius:16px;max-width:600px;margin:40px auto;box-shadow:0 10px 40px rgba(0,0,0,.4)}}
+.btn{{display:inline-block;margin-top:16px;background:#3b6ef0;color:#fff;padding:12px 22px;border-radius:10px;text-decoration:none}}
+</style></head><body><div class="card">
+<h1>Lingovox AI</h1><p>AI voice translator for Telegram.</p>
+<p><b>Supported:</b> {langs}</p>
+<a class="btn" href="{bot_link}">Open Bot</a></div></body></html>"""
     return HTMLResponse(content=html)
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms():
+    return HTMLResponse("<h1>Terms of Service</h1><p>Lingovox voice translation service.</p>")
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy():
+    return HTMLResponse("<h1>Privacy Policy</h1><p>Voice data is processed only to provide translations.</p>")
 
 
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
-    update = await req.json()
+    try:
+        update = await req.json()
+    except Exception:
+        return JSONResponse({"ok": True})
+
     try:
         if "message" in update:
-            msg = update["message"]
-            chat_id = msg.get("chat", {}).get("id")
-            if not chat_id: return JSONResponse({"ok": True})
-            text = (msg.get("text") or "").strip()
-
-            if text == "/start":
-                with SessionLocal() as db:
-                    u = ensure_user(db, chat_id)
-                    tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
-                return JSONResponse({"ok": True})
-
-            if text == "/buy":
-                tg_send_message(chat_id, "💳 Choose package:", reply_markup=build_packages_keyboard())
-                return JSONResponse({"ok": True})
-
-            if text.startswith("/support"):
-                if text == "/support":
-                    tg_send_message(chat_id, "🆘 Send: /support <your message>")
-                else:
-                    ticket_text = text.split(" ", 1)[1].strip()
-                    with SessionLocal() as db:
-                        t = SupportTicket(telegram_id=chat_id, message=ticket_text)
-                        db.add(t); db.commit(); db.refresh(t)
-                        tg_send_message(chat_id, f"✅ Ticket #{t.id} created.")
-                        admin_notify(f"🆘 New ticket #{t.id} from {chat_id}: {ticket_text}")
-                return JSONResponse({"ok": True})
-
-            if text == "/stat" and is_admin(chat_id):
-                with SessionLocal() as db:
-                    u_cnt = db.query(User).count()
-                    p_cnt = db.query(Payment).filter(Payment.status == "paid").count()
-                    tg_send_message(chat_id, f"📊 Users: {u_cnt}\nPaid payments: {p_cnt}")
-                return JSONResponse({"ok": True})
-
-            if text.startswith("/reply") and is_admin(chat_id):
-                parts = text.split(maxsplit=2)
-                if len(parts) == 3:
-                    tid, rmsg = int(parts[1]), parts[2]
-                    with SessionLocal() as db:
-                        t = db.get(SupportTicket, tid)
-                        if t:
-                            tg_send_message(t.telegram_id, f"✅ Support reply:\n{rmsg}")
-                            t.status = "closed"
-                            db.commit()
-                            tg_send_message(chat_id, f"✅ Replied to #{tid}")
-                return JSONResponse({"ok": True})
-
-            if "voice" in msg:
-                v = msg["voice"]
-                fid, dur = v["file_id"], int(v.get("duration", 0))
-                with SessionLocal() as db:
-                    u = ensure_user(db, chat_id)
-                    b_mode, ch = decide_billing(u, dur)
-                    if b_mode == "deny":
-                        tg_send_message(chat_id, "⛔ Not enough balance. Tap “Buy minutes”.", reply_markup=user_keyboard(u))
-                        return JSONResponse({"ok": True})
-
-                    gf = requests.get(f"{TG_API}/getFile", params={"file_id": fid}).json()
-                    furl = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{gf['result']['file_path']}"
-                    audio = requests.get(furl).content
-
-                    try:
-                        trans = openai_transcribe_verbose(audio)
-                        otext = trans["text"]
-                        if not otext: raise RuntimeError("Empty voice")
-
-                        if u.mode == "conversation":
-                            source_lang = (u.conversation_source_lang or "").strip()
-                            target_lang = (u.conversation_target_lang or "").strip()
-                            setup = parse_conversation_setup(otext)
-
-                            if setup.get("has_setup_command") and setup.get("target_lang"):
-                                target_lang = canonicalize_language_name(setup["target_lang"])
-                                stext = setup.get("message_text") or otext
-                                source_lang = canonicalize_language_name(detect_language_name_from_text(stext))
-                                if normalize_language_name(source_lang) == normalize_language_name(target_lang):
-                                    raise RuntimeError("Languages are the same.")
-                                u.conversation_source_lang, u.conversation_target_lang = source_lang, target_lang
-                                db.commit()
-                                translate_to, resolved_in = target_lang, source_lang
-                                to_translate = stext
-                            else:
-                                if not source_lang or not target_lang:
-                                    raise RuntimeError("Conversation is not configured. Say 'Translate to Spanish: ...'")
-                                inc_lang = detect_language_name_from_text(otext)
-                                translate_to, resolved_in = decide_conversation_target_any(source_lang, target_lang, inc_lang)
-                                to_translate = otext
-
-                            ttext = openai_translate_text(to_translate, translate_to, source_lang=resolved_in)
-                        else:
-                            ttext = openai_translate_text(otext, lang_name(u.target_lang))
-                        
-                        tts = openai_tts(ttext)
-                        apply_billing(db, u, b_mode, ch)
-                        db.commit()
-                        
-                        cap = f"🎁 Trial left: {u.trial_left}" if b_mode == "trial" else f"💳 Balance: {u.balance_seconds//60} min"
-                        tg_send_voice(chat_id, tts, caption=cap)
-                        tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
-                    except Exception as e:
-                        log.exception("Voice error")
-                        tg_send_message(chat_id, f"⚠️ Error: {e}")
-                return JSONResponse({"ok": True})
-
-        if "callback_query" in update:
-            cq = update["callback_query"]
-            data, chat_id, cq_id = cq["data"], cq["message"]["chat"]["id"], cq["id"]
-
-            with SessionLocal() as db:
-                u = ensure_user(db, chat_id)
-                if data.startswith("lang:"):
-                    u.target_lang, u.mode = data.split(":")[1], "translate"
-                    u.conversation_source_lang = u.conversation_target_lang = None
-                    db.commit()
-                    tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
-                elif data == "mode:conversation":
-                    u.mode = "conversation"
-                    u.conversation_source_lang = u.conversation_target_lang = None
-                    db.commit()
-                    tg_send_message(chat_id, "🗣 Conversation mode on. Use voice command to set languages.", reply_markup=user_keyboard(u))
-                elif data == "conversation:reset":
-                    u.conversation_source_lang = u.conversation_target_lang = None
-                    db.commit()
-                    tg_send_message(chat_id, "🔄 Reset. Send setup phrase.", reply_markup=user_keyboard(u))
-                elif data == "buy:menu": tg_send_message(chat_id, "💳 Choose package:", reply_markup=build_packages_keyboard())
-                elif data == "support:menu": tg_send_message(chat_id, "🆘 Use /support <message>")
-                elif data.startswith("paddle:") or data.startswith("buy:"):
-                    # Логика создания инвойсов (оставлена без изменений для экономии места)
-                    pass
-
-            tg_answer_callback(cq_id)
-            return JSONResponse({"ok": True})
-    except Exception as e:
+            await _handle_message(update["message"])
+        elif "callback_query" in update:
+            _handle_callback(update["callback_query"])
+    except Exception:
         log.exception("Webhook error")
     return JSONResponse({"ok": True})
 
 
-@app.post(POSTBACK_PATH)
-async def nowpayments_postback(req: Request):
-    raw, sig = await req.body(), req.headers.get("x-nowpayments-sig", "")
-    if not verify_nowpayments_signature(raw, sig): return PlainTextResponse("invalid", status_code=400)
-    data = json.loads(raw.decode())
+async def _handle_message(msg: Dict[str, Any]) -> None:
+    chat_id = msg.get("chat", {}).get("id")
+    if not chat_id:
+        return
+    text = (msg.get("text") or "").strip()
+
+    # --- Commands ---
+    if text == "/start":
+        with SessionLocal() as db:
+            u = ensure_user(db, chat_id)
+            tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
+        return
+
+    if text in ("/help", "/menu"):
+        with SessionLocal() as db:
+            u = ensure_user(db, chat_id)
+            help_text = (
+                "ℹ️ Lingovox help\n\n"
+                "• Pick a target language, then send voice — I translate & reply with voice.\n"
+                "• 🗣 Conversation: say \"Translate to Spanish: hello\" to set a pair, "
+                "then speak in either language.\n"
+                "• /buy — buy minutes\n"
+                "• /support <message> — contact support"
+            )
+            tg_send_message(chat_id, help_text, reply_markup=user_keyboard(u))
+        return
+
+    if text == "/buy":
+        tg_send_message(chat_id, "💳 Choose package:", reply_markup=build_packages_keyboard())
+        return
+
+    if text.startswith("/support"):
+        if text == "/support":
+            tg_send_message(chat_id, "🆘 Send: /support <your message>")
+        else:
+            ticket_text = text.split(" ", 1)[1].strip()
+            with SessionLocal() as db:
+                t = SupportTicket(telegram_id=chat_id, message=ticket_text)
+                db.add(t)
+                db.commit()
+                db.refresh(t)
+                tg_send_message(chat_id, f"✅ Ticket #{t.id} created. We'll get back to you.")
+                admin_notify(f"🆘 New ticket #{t.id} from {chat_id}: {ticket_text}")
+        return
+
+    if text == "/stat" and is_admin(chat_id):
+        with SessionLocal() as db:
+            u_cnt = db.query(User).count()
+            p_cnt = db.query(Payment).filter(Payment.status == "paid").count()
+            tg_send_message(chat_id, f"📊 Users: {u_cnt}\nPaid payments: {p_cnt}")
+        return
+
+    if text.startswith("/reply") and is_admin(chat_id):
+        parts = text.split(maxsplit=2)
+        if len(parts) == 3:
+            tid, rmsg = int(parts[1]), parts[2]
+            with SessionLocal() as db:
+                t = db.get(SupportTicket, tid)
+                if t:
+                    tg_send_message(t.telegram_id, f"✅ Support reply:\n{rmsg}")
+                    t.status = "closed"
+                    db.commit()
+                    tg_send_message(chat_id, f"✅ Replied to #{tid}")
+        return
+
+    # --- Voice ---
+    if "voice" in msg:
+        v = msg["voice"]
+        fid = v["file_id"]
+        dur = int(v.get("duration", 0))
+        with SessionLocal() as db:
+            u = ensure_user(db, chat_id)
+            try:
+                process_voice(db, u, chat_id, fid, dur)
+            except Exception as e:
+                log.exception("Voice processing error")
+                tg_send_message(chat_id, f"⚠️ {e}", reply_markup=user_keyboard(u))
+        return
+
+    # --- Fallback for plain text ---
+    if text:
+        with SessionLocal() as db:
+            u = ensure_user(db, chat_id)
+            tg_send_message(
+                chat_id,
+                "🎙 Send me a *voice* message to translate. Use /help for options.",
+                reply_markup=user_keyboard(u),
+            )
+
+
+def _handle_callback(cq: Dict[str, Any]) -> None:
+    data = cq.get("data", "")
+    chat_id = cq["message"]["chat"]["id"]
+    cq_id = cq["id"]
+
     with SessionLocal() as db:
-        p = db.query(Payment).filter(Payment.order_id == data.get("order_id")).first()
-        if p and p.status != "paid" and data.get("payment_status") in ("finished", "confirmed", "paid"):
-            credit_payment_if_needed(db, p)
-    return PlainTextResponse("ok")
+        u = ensure_user(db, chat_id)
+
+        if data.startswith("lang:"):
+            code = data.split(":", 1)[1]
+            if code in SUPPORTED_LANG_CODES:
+                u.target_lang = code
+                u.mode = "translate"
+                u.conversation_source_lang = None
+                u.conversation_target_lang = None
+                db.commit()
+                tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
+
+        elif data == "mode:conversation":
+            u.mode = "conversation"
+            # НЕ сбрасываем уже настроенную пару — удобнее для пользователя
+            db.commit()
+            tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
+
+        elif data == "conversation:reset":
+            u.conversation_source_lang = None
+            u.conversation_target_lang = None
+            db.commit()
+            tg_send_message(chat_id, "🔄 Conversation reset. Send a setup phrase.", reply_markup=user_keyboard(u))
+
+        elif data == "buy:menu":
+            tg_send_message(chat_id, "💳 Choose package:", reply_markup=build_packages_keyboard())
+
+        elif data == "buy:back":
+            tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
+
+        elif data == "support:menu":
+            tg_send_message(chat_id, "🆘 Use /support <message> to contact us.")
+
+        elif data.startswith("paddle:"):
+            handle_card_purchase(db, chat_id, data.split(":", 1)[1])
+
+    tg_answer_callback(cq_id)
 
 
 @app.post(PADDLE_POSTBACK_PATH)
 async def paddle_postback(req: Request):
-    raw, sig = await req.body(), req.headers.get("Paddle-Signature", "")
-    if not verify_paddle_signature(raw, sig): return PlainTextResponse("invalid", status_code=400)
-    data = json.loads(raw.decode())
+    raw = await req.body()
+    sig = req.headers.get("Paddle-Signature", "")
+    if not verify_paddle_signature(raw, sig):
+        return PlainTextResponse("invalid", status_code=400)
+    try:
+        data = json.loads(raw.decode())
+    except Exception:
+        return PlainTextResponse("bad json", status_code=400)
     if data.get("event_type") == "transaction.completed":
-        tid = data["data"]["id"]
+        tid = data.get("data", {}).get("id")
         with SessionLocal() as db:
             p = db.query(Payment).filter(Payment.invoice_id == tid).first()
-            if p: credit_payment_if_needed(db, p)
+            if p:
+                credit_payment_if_needed(db, p)
     return PlainTextResponse("ok")
-
-
-@app.get("/terms")
-def terms(): return HTMLResponse("<h1>Terms of Service</h1>")
-
-
-@app.get("/privacy")
-def privacy(): return HTMLResponse("<h1>Privacy Policy</h1>")
