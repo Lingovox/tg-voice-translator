@@ -467,7 +467,7 @@ def build_lang_keyboard(user: "User") -> Dict[str, Any]:
 def build_packages_keyboard(user: "User") -> Dict[str, Any]:
     ui = ui_of(user)
     rows = []
-    for code in ("P30", "P60", "P180", "P600"):
+    for code in ("P60", "P180", "P600"):
         pkg = PACKAGES[code]
         label = t("pkg_card", ui, min=pkg["minutes"], usd=pkg["usd"])
         rows.append([{"text": label, "callback_data": f"paddle:{code}"}])
