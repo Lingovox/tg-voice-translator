@@ -437,10 +437,10 @@ def build_main_keyboard(user: "User") -> Dict[str, Any]:
     conv_prefix = "✅ " if mode == "conversation" else ""
     rows.append([{"text": f"{conv_prefix}{t('btn_conversation', ui)}", "callback_data": "mode:conversation"}])
 
-    if mode != "conversation":
-        # Язык перевода спрятан за одной кнопкой — меню не разрастается
-        rows.append([{"text": t("btn_target_lang", ui), "callback_data": "lang:menu"}])
-    elif conversation_ready:
+    # Кнопка выбора языка перевода видна всегда (в т.ч. в режиме диалога)
+    rows.append([{"text": t("btn_target_lang", ui), "callback_data": "lang:menu"}])
+    # В режиме диалога с настроенной парой даём сброс
+    if mode == "conversation" and conversation_ready:
         rows.append([{"text": t("btn_reset_conv", ui), "callback_data": "conversation:reset"}])
 
     rows.append([
