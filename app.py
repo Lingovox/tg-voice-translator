@@ -310,7 +310,9 @@ def format_status_text(user: "User") -> str:
         else:
             conversation_line = (
                 "🗣 Conversation mode is on\n"
-                "Start with a phrase like: \"Translate to Spanish: hello, how are you?\"\n"
+                "Скажите голосом фразу-команду, например:\n"
+                "«переведи на испанский, как тебя зовут»\n"
+                "Я запомню пару языков и дальше буду переводить в обе стороны.\n"
             )
         return (
             "🎙 Lingovox — AI live conversation\n\n"
@@ -368,7 +370,14 @@ def openai_transcribe(ogg_bytes: bytes) -> str:
 
 def openai_tts(text: str) -> bytes:
     url = "https://api.openai.com/v1/audio/speech"
-    body = {"model": "tts-1", "voice": OPENAI_TTS_VOICE, "format": "ogg", "input": text}
+    # Telegram voice ждёт OGG/OPUS. У OpenAI параметр называется response_format,
+    # а не format — иначе вернётся mp3 и звук будет "кашей".
+    body = {
+        "model": "tts-1",
+        "voice": OPENAI_TTS_VOICE,
+        "response_format": "opus",
+        "input": text,
+    }
     r = _openai_post(url, json_body=body, timeout=120)
     return r.content
 
@@ -386,11 +395,41 @@ def openai_translate_text(text: str, target_lang: str, source_lang: Optional[str
     return r.json()["choices"][0]["message"]["content"].strip()
 
 
+def gpt_parse_setup(text: str) -> Dict[str, str]:
+    """
+    Надёжный разбор команды настройки через GPT (не зависит от пунктуации Whisper).
+    Возвращает {'target_code': <код или ''>, 'message_text': <что переводить>}.
+    """
+    url = "https://api.openai.com/v1/chat/completions"
+    codes = ", ".join(sorted(SUPPORTED_LANG_CODES))
+    prompt = (
+        "The user is configuring a voice translator. The phrase contains an instruction like "
+        "'translate to <language>' / 'переведи на <язык>' followed by the actual text to translate. "
+        "Speech-to-text may have NO punctuation, so split by meaning.\n"
+        f"Return ONLY JSON: {{\"target\":\"<code>\",\"message\":\"<text to translate>\"}}. "
+        f"target must be one of these codes (or empty if unclear): {codes}.\n"
+        "message must be ONLY the part to translate, without the command words.\n\n"
+        f"Phrase:\n{text}"
+    )
+    body = {
+        "model": OPENAI_TEXT_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        r = _openai_post(url, json_body=body, timeout=60)
+        out = json.loads(r.json()["choices"][0]["message"]["content"])
+        return {
+            "target_code": normalize_lang_code(str(out.get("target") or "")),
+            "message_text": str(out.get("message") or "").strip(),
+        }
+    except Exception as e:
+        log.warning("gpt_parse_setup failed: %s", e)
+        return {"target_code": "", "message_text": ""}
+
+
 def detect_language_code(text: str) -> str:
     """Определяет язык текста и возвращает код из SUPPORTED_LANG_CODES (или '')."""
-    local = find_language_code_in_text(text)
-    if local:
-        return local
     url = "https://api.openai.com/v1/chat/completions"
     codes = ", ".join(sorted(SUPPORTED_LANG_CODES))
     prompt = (
@@ -414,24 +453,29 @@ def detect_language_code(text: str) -> str:
 # Conversation setup parsing
 # =========================================================
 SETUP_PATTERNS = [
-    r"^\s*переведи\s+на\s+(.+?)(?:\s+язык)?\s*[,:;\.\!\?\-]\s*(.+)$",
-    r"^\s*перевести\s+на\s+(.+?)(?:\s+язык)?\s*[,:;\.\!\?\-]\s*(.+)$",
-    r"^\s*translate\s+(?:to|into)\s+(.+?)\s*[,:;\.\!\?\-]\s*(.+)$",
-    r"^\s*übersetze\s+(?:auf|ins?|in)\s+(.+?)\s*[,:;\.\!\?\-]\s*(.+)$",
+    r"^\s*переведи(?:те)?\s+на\s+(.+?)(?:\s+язык\w*)?\s*[,:;\.\!\?\-—–]\s*(.+)$",
+    r"^\s*перевести\s+на\s+(.+?)(?:\s+язык\w*)?\s*[,:;\.\!\?\-—–]\s*(.+)$",
+    r"^\s*translate\s+(?:to|into)\s+(.+?)\s*[,:;\.\!\?\-—–]\s*(.+)$",
+    r"^\s*übersetze\s+(?:auf|ins?|in)\s+(.+?)\s*[,:;\.\!\?\-—–]\s*(.+)$",
+]
+
+SETUP_TRIGGERS = [
+    "translate to", "translate into",
+    "переведи на", "переведите на", "перевести на",
+    "übersetze auf", "übersetze ins", "übersetze in",
 ]
 
 
 def parse_conversation_setup(text: str) -> Dict[str, Any]:
     """
-    Пытается распознать команду вида 'Translate to Spanish: hello'.
-    Возвращает target_code (код языка из LANGS или ''), message_text, has_command.
+    Распознаёт команду вида 'переведи на испанский: как тебя зовут'.
+    Работает даже без пунктуации (через GPT-fallback).
+    Возвращает target_code (код языка или ''), message_text, has_command.
     """
     original = (text or "").strip()
     low = original.lower()
-    has_command = any(c in low for c in [
-        "translate to", "translate into", "переведи на", "перевести на",
-        "übersetze auf", "übersetze ins", "übersetze in",
-    ])
+    has_command = any(c in low for c in SETUP_TRIGGERS)
+
     target_raw = ""
     message_text = original
     for pattern in SETUP_PATTERNS:
@@ -441,6 +485,16 @@ def parse_conversation_setup(text: str) -> Dict[str, Any]:
             message_text = m.group(2).strip()
             break
     target_code = normalize_lang_code(target_raw) if target_raw else ""
+
+    # Whisper часто отдаёт речь без знаков препинания → regex не срабатывает.
+    # Если есть слова-триггеры, но язык/текст не выделены — разбираем через GPT.
+    if has_command and (not target_code or message_text == original):
+        gpt = gpt_parse_setup(original)
+        if gpt["target_code"]:
+            target_code = gpt["target_code"]
+        if gpt["message_text"]:
+            message_text = gpt["message_text"]
+
     return {
         "target_code": target_code,
         "message_text": message_text,
@@ -640,6 +694,7 @@ def process_voice(db, user: "User", chat_id: int, file_id: str, duration: int) -
 
     audio = tg_download_voice(file_id)
     transcript = openai_transcribe(audio)
+    log.info("Voice from %s (%ss): transcript=%r", chat_id, duration, transcript)
     if not transcript:
         raise RuntimeError("Empty voice message")
 
@@ -648,6 +703,7 @@ def process_voice(db, user: "User", chat_id: int, file_id: str, duration: int) -
     else:
         translated = openai_translate_text(transcript, lang_name(user.target_lang))
         used_caption = None
+    log.info("Voice from %s: translated=%r", chat_id, translated)
 
     tts = openai_tts(translated)
     apply_billing(db, user, b_mode, charge)
@@ -659,6 +715,12 @@ def process_voice(db, user: "User", chat_id: int, file_id: str, duration: int) -
         cap = f"💳 Balance: {user.balance_seconds // 60} min"
     if used_caption:
         cap = f"{used_caption}\n{cap}"
+    # Показываем распознанный и переведённый текст — видно, если звук не совпал
+    text_block = f"📝 {transcript}\n➡️ {translated}"
+    cap = f"{text_block}\n{cap}"
+    # Подпись Telegram ограничена ~1024 символами
+    if len(cap) > 1000:
+        cap = cap[:997] + "..."
 
     tg_send_voice(chat_id, tts, caption=cap)
     tg_send_message(chat_id, format_status_text(user), reply_markup=user_keyboard(user))
@@ -668,10 +730,19 @@ def _process_conversation_voice(db, user: "User", transcript: str) -> Tuple[str,
     source_code = (user.conversation_source_lang or "").strip()
     target_code = (user.conversation_target_lang or "").strip()
     setup = parse_conversation_setup(transcript)
+    log.info(
+        "Conversation parse: has_command=%s target=%r msg=%r (pair: %s/%s)",
+        setup["has_command"], setup["target_code"], setup["message_text"], source_code, target_code,
+    )
 
     # Команда настройки пары языков
-    if setup["has_command"] and setup["target_code"]:
+    if setup["has_command"]:
         new_target = setup["target_code"]
+        if not new_target:
+            raise RuntimeError(
+                "Не понял, на какой язык переводить. Скажите, например: "
+                "«переведи на испанский, как тебя зовут»."
+            )
         msg = setup["message_text"] or transcript
         new_source = detect_language_code(msg)
         if not new_source or new_source == new_target:
@@ -680,16 +751,21 @@ def _process_conversation_voice(db, user: "User", transcript: str) -> Tuple[str,
         user.conversation_source_lang = new_source
         user.conversation_target_lang = new_target
         db.commit()
+        log.info("Conversation pair set: %s ↔ %s", new_source, new_target)
         translated = openai_translate_text(msg, lang_name(new_target), source_lang=lang_name(new_source))
         caption = f"🗣 {lang_name(new_source)} → {lang_name(new_target)}"
         return translated, caption
 
     # Пара ещё не настроена
     if not source_code or not target_code:
-        raise RuntimeError("Conversation not configured. Say e.g. \"Translate to Spanish: hello\"")
+        raise RuntimeError(
+            "Сначала задайте пару голосом, например: "
+            "«переведи на испанский, как тебя зовут»."
+        )
 
     incoming = detect_language_code(transcript)
     translate_to, detected_from = resolve_conversation_direction(source_code, target_code, incoming)
+    log.info("Conversation route: incoming=%s -> translate_to=%s", incoming, translate_to)
     translated = openai_translate_text(
         transcript, lang_name(translate_to), source_lang=lang_name(detected_from) if detected_from else None
     )
@@ -875,7 +951,7 @@ def _handle_callback(cq: Dict[str, Any]) -> None:
             u.conversation_source_lang = None
             u.conversation_target_lang = None
             db.commit()
-            tg_send_message(chat_id, "🔄 Conversation reset. Send a setup phrase.", reply_markup=user_keyboard(u))
+            tg_send_message(chat_id, "🔄 Пара языков сброшена. Скажите команду заново, например: «переведи на испанский, как тебя зовут».", reply_markup=user_keyboard(u))
 
         elif data == "buy:menu":
             tg_send_message(chat_id, "💳 Choose package:", reply_markup=build_packages_keyboard())
