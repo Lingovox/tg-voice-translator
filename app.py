@@ -696,7 +696,9 @@ def detect_language_from_text(text: str) -> str:
         "response_format": {"type": "json_object"}
     }
     r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200: raise RuntimeError(f"Detect failed: {r.text}")
+    if r.status_code != 200:
+        raise RuntimeError(f"Detect failed: {r.text}")
     out = r.json()["choices"][0]["message"]["content"]
     try:
-        parsed
+        parsed = json.loads(out)
+        language = str(parsed.get("
