@@ -5,7 +5,7 @@ import logging
 import hashlib
 import hmac
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Dict, Any, Tuple, List
 
 import requests
@@ -14,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 
 from sqlalchemy import (
-    create_engine, Column, Integer, BigInteger, String, Boolean, DateTime
+    create_engine, Column, Integer, BigInteger, String, Boolean, DateTime, func
 )
 from sqlalchemy.orm import sessionmaker, declarative_base
 
@@ -58,6 +58,9 @@ TRIAL_MAX_SECONDS = int(os.getenv("TRIAL_MAX_SECONDS", "60"))
 MIN_BILLABLE_SECONDS = int(os.getenv("MIN_BILLABLE_SECONDS", "1"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "90"))
+
+# Смещение часового пояса для границы "сегодня" в статистике (Ташкент = +5)
+STAT_TZ_OFFSET = int(os.getenv("STAT_TZ_OFFSET", "5"))
 
 
 # =========================================================
@@ -195,6 +198,17 @@ class SupportTicket(Base):
     status = Column(String, nullable=False, default="open")
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class UsageEvent(Base):
+    """Одна строка на каждый успешный перевод — для статистики использования."""
+    __tablename__ = "usage_events"
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    mode = Column(String, nullable=False, default="translate")  # translate | conversation
+    billing = Column(String, nullable=False, default="trial")   # trial | paid
+    seconds = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 
 def init_db():
@@ -709,6 +723,85 @@ def admin_notify(text: str) -> None:
             pass
 
 
+def _today_utc_bounds() -> Tuple[datetime, datetime]:
+    """
+    Возвращает (start_utc, end_utc) для "сегодня" в локальном часовом поясе.
+    created_at хранится в UTC, поэтому сдвигаем границы на STAT_TZ_OFFSET.
+    """
+    now_local = datetime.utcnow() + timedelta(hours=STAT_TZ_OFFSET)
+    local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = local_midnight - timedelta(hours=STAT_TZ_OFFSET)
+    return start_utc, start_utc + timedelta(days=1)
+
+
+def build_today_stats(db) -> str:
+    start, end = _today_utc_bounds()
+
+    def in_today(col):
+        return (col >= start) & (col < end)
+
+    # Активные пользователи и переводы за сегодня
+    active_users = (
+        db.query(func.count(func.distinct(UsageEvent.telegram_id)))
+        .filter(in_today(UsageEvent.created_at))
+        .scalar() or 0
+    )
+    translations = (
+        db.query(func.count(UsageEvent.id))
+        .filter(in_today(UsageEvent.created_at))
+        .scalar() or 0
+    )
+    trial_cnt = (
+        db.query(func.count(UsageEvent.id))
+        .filter(in_today(UsageEvent.created_at), UsageEvent.billing == "trial")
+        .scalar() or 0
+    )
+    paid_cnt = translations - trial_cnt
+    conv_cnt = (
+        db.query(func.count(UsageEvent.id))
+        .filter(in_today(UsageEvent.created_at), UsageEvent.mode == "conversation")
+        .scalar() or 0
+    )
+    seconds_used = (
+        db.query(func.coalesce(func.sum(UsageEvent.seconds), 0))
+        .filter(in_today(UsageEvent.created_at))
+        .scalar() or 0
+    )
+
+    # Новые пользователи за сегодня
+    new_users = (
+        db.query(func.count(User.telegram_id))
+        .filter(in_today(User.created_at))
+        .scalar() or 0
+    )
+
+    # Оплаты и доход за сегодня (по дате оплаты — updated_at у paid)
+    paid_today = (
+        db.query(Payment)
+        .filter(Payment.status == "paid", in_today(Payment.updated_at))
+        .all()
+    )
+    revenue = sum(int(p.amount_usd or 0) for p in paid_today)
+
+    # Всего (для контекста)
+    total_users = db.query(func.count(User.telegram_id)).scalar() or 0
+
+    minutes_used = seconds_used // 60
+    return (
+        "📊 Статистика за сегодня\n"
+        f"(день по UTC+{STAT_TZ_OFFSET})\n\n"
+        f"👥 Активных юзеров: {active_users}\n"
+        f"🆕 Новых юзеров: {new_users}\n"
+        f"🎙 Переводов: {translations}\n"
+        f"   ├ trial: {trial_cnt}\n"
+        f"   ├ платных: {paid_cnt}\n"
+        f"   └ в режиме диалога: {conv_cnt}\n"
+        f"⏱ Использовано: ~{minutes_used} мин\n"
+        f"💳 Оплат: {len(paid_today)} на ${revenue}\n\n"
+        f"Всего юзеров в базе: {total_users}"
+    )
+
+
 # =========================================================
 # Voice processing
 # =========================================================
@@ -733,6 +826,12 @@ def process_voice(db, user: "User", chat_id: int, file_id: str, duration: int) -
 
     tts = openai_tts(translated)
     apply_billing(db, user, b_mode, charge)
+    db.add(UsageEvent(
+        telegram_id=chat_id,
+        mode=(user.mode or "translate"),
+        billing=b_mode,
+        seconds=max(MIN_BILLABLE_SECONDS, int(duration)),
+    ))
     db.commit()
 
     if b_mode == "trial":
@@ -907,9 +1006,7 @@ async def _handle_message(msg: Dict[str, Any]) -> None:
 
     if text == "/stat" and is_admin(chat_id):
         with SessionLocal() as db:
-            u_cnt = db.query(User).count()
-            p_cnt = db.query(Payment).filter(Payment.status == "paid").count()
-            tg_send_message(chat_id, f"📊 Users: {u_cnt}\nPaid payments: {p_cnt}")
+            tg_send_message(chat_id, build_today_stats(db))
         return
 
     if text.startswith("/reply") and is_admin(chat_id):
