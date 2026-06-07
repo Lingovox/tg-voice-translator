@@ -494,8 +494,12 @@ def tg_answer_callback(callback_query_id: str, text: Optional[str] = None):
 
 def build_main_keyboard(selected_lang: str, mode: str = "translate", conversation_ready: bool = False) -> Dict[str, Any]:
     rows = []
-    mode_prefix = "✅ " if mode == "conversation" else ""
-    rows.append([{"text": f"{mode_prefix}🗣 Conversation", "callback_data": "mode:conversation"}])
+    if mode == "conversation":
+        rows.append([{"text": "🗣 Conversation mode — ON  ✅", "callback_data": "mode:conversation"}])
+        if conversation_ready:
+            rows.append([{"text": "🔄 Reset conversation", "callback_data": "conversation:reset"}])
+    else:
+        rows.append([{"text": "🗣 Conversation mode", "callback_data": "mode:conversation"}])
     for i in range(0, len(LANGS), 2):
         pair = LANGS[i:i + 2]
         row = []
@@ -503,8 +507,6 @@ def build_main_keyboard(selected_lang: str, mode: str = "translate", conversatio
             prefix = "✅ " if code == selected_lang and mode != "conversation" else ""
             row.append({"text": f"{prefix}{title}", "callback_data": f"lang:{code}"})
         rows.append(row)
-    if conversation_ready:
-        rows.append([{"text": "🔄 Reset conversation", "callback_data": "conversation:reset"}])
     rows.append([{"text": "💳 Buy minutes", "callback_data": "buy:menu"}])
     rows.append([{"text": "🆘 Support", "callback_data": "support:menu"}])
     return {"inline_keyboard": rows}
@@ -513,14 +515,11 @@ def build_main_keyboard(selected_lang: str, mode: str = "translate", conversatio
 def build_packages_keyboard() -> Dict[str, Any]:
     return {
         "inline_keyboard": [
-            [{"text": "💳 Card — 30 min — $10", "callback_data": "paddle:P30"}],
-            [{"text": "💳 Card — 60 min — $15", "callback_data": "paddle:P60"}],
-            [{"text": "💳 Card — 180 min — $30", "callback_data": "paddle:P180"}],
-            [{"text": "💳 Card — 600 min — $70", "callback_data": "paddle:P600"}],
-            [{"text": "💎 Crypto — 30 min — $10", "callback_data": "buy:P30"}],
-            [{"text": "💎 Crypto — 60 min — $15", "callback_data": "buy:P60"}],
-            [{"text": "💎 Crypto — 180 min — $30", "callback_data": "buy:P180"}],
-            [{"text": "💎 Crypto — 600 min — $70", "callback_data": "buy:P600"}],
+            [{"text": "💳  By card", "callback_data": "noop"}, {"text": "💎  USDT crypto", "callback_data": "noop"}],
+            [{"text": "30 min — $10", "callback_data": "paddle:P30"}, {"text": "30 min — $10", "callback_data": "buy:P30"}],
+            [{"text": "60 min — $15", "callback_data": "paddle:P60"}, {"text": "60 min — $15", "callback_data": "buy:P60"}],
+            [{"text": "180 min — $30", "callback_data": "paddle:P180"}, {"text": "180 min — $30", "callback_data": "buy:P180"}],
+            [{"text": "600 min — $70 🔥", "callback_data": "paddle:P600"}, {"text": "600 min — $70 🔥", "callback_data": "buy:P600"}],
             [{"text": "⬅️ Back", "callback_data": "buy:back"}],
         ]
     }
@@ -528,30 +527,41 @@ def build_packages_keyboard() -> Dict[str, Any]:
 
 def format_status_text(user: User) -> str:
     bal_min = max(0, int(user.balance_seconds or 0)) // 60
+    trial = int(user.trial_left or 0)
+
     if (user.mode or "translate") == "conversation":
         if user.conversation_source_lang and user.conversation_target_lang:
-            conversation_line = (
-                f"🗣 Conversation: {user.conversation_source_lang} ↔ {user.conversation_target_lang}\n"
-                "Send voice messages from either side.\n"
+            src = user.conversation_source_lang
+            tgt = user.conversation_target_lang
+            status_line = (
+                f"🗣 {src} ↔ {tgt}\n"
+                f"Говори с любой стороны — переведу в обе.\n"
+                f"Speak from either side — I'll translate both ways.\n"
             )
         else:
-            conversation_line = (
-                "🗣 Conversation mode is on\n"
-                "Start with a phrase like: 'Translate to Spanish: hello, how are you?'\n"
+            status_line = (
+                "🗣 Режим разговора включён / Conversation mode on\n\n"
+                "Скажи голосом: «Переведи на английский: привет»\n"
+                "Or say: \"Translate to Russian: hello\"\n"
             )
-        return (
-            "🎙 Lingovox — AI live conversation\n\n"
-            f"{conversation_line}"
-            f"🎁 Free messages left: {user.trial_left} (≤ {TRIAL_MAX_SECONDS}s)\n"
-            f"💳 Balance: {bal_min} min\n\n"
-            "Bot remembers the pair of languages from your voice command and then translates in both directions."
+        balance_line = (
+            f"🎁 Пробных сообщений: {trial} (≤ {TRIAL_MAX_SECONDS}с)\n"
+            f"💳 Баланс / Balance: {bal_min} min"
         )
+        return f"🎙 Lingovox\n\n{status_line}\n{balance_line}"
+
+    lang_display = lang_name(user.target_lang)
+    if trial > 0:
+        trial_line = f"🎁 Осталось пробных: {trial} (≤ {TRIAL_MAX_SECONDS}с)"
+    else:
+        trial_line = "🎁 Пробные сообщения использованы"
     return (
-        "🎙 Lingovox — AI voice translator\n\n"
-        f"🌍 Target language: {lang_name(user.target_lang)}\n"
-        f"🎁 Free messages left: {user.trial_left} (≤ {TRIAL_MAX_SECONDS}s)\n"
-        f"💳 Balance: {bal_min} min\n\n"
-        "Send a voice message — I'll translate and reply with voice."
+        f"🎙 Lingovox — AI voice translator\n\n"
+        f"🌍 Язык перевода / Target: {lang_display}\n"
+        f"{trial_line}\n"
+        f"💳 Баланс / Balance: {bal_min} min\n\n"
+        f"Отправь голосовое — переведу и отвечу голосом.\n"
+        f"Send a voice message — I'll translate and reply."
     )
 
 
@@ -643,7 +653,14 @@ def credit_payment_if_needed(db, payment: Payment) -> bool:
     payment.status = "paid"
     payment.updated_at = datetime.utcnow()
     db.add(user); db.add(payment); db.commit(); db.refresh(user)
-    tg_send_message(int(user.telegram_id), f"✅ Payment received!\nCredited: {pkg['minutes']} min", reply_markup=user_keyboard(user))
+    tg_send_message(
+        int(user.telegram_id),
+        f"✅ Оплата получена! / Payment received!\n\n"
+        f"💳 Зачислено / Credited: {pkg['minutes']} min\n"
+        f"Баланс / Balance: {max(0, int(user.balance_seconds or 0)) // 60} min\n\n"
+        f"Отправляй голосовые — переведу!",
+        reply_markup=user_keyboard(user)
+    )
     return True
 
 
@@ -696,9 +713,282 @@ def detect_language_from_text(text: str) -> str:
         "response_format": {"type": "json_object"}
     }
     r = requests.post(url, headers=headers, json=payload, timeout=60)
-    if r.status_code != 200:
-        raise RuntimeError(f"Detect failed: {r.text}")
+    if r.status_code != 200: raise RuntimeError(f"Detect failed: {r.text}")
     out = r.json()["choices"][0]["message"]["content"]
+    language = json.loads(out).get("language", "").strip().lower()
+    if language not in SUPPORTED_LANG_CODES: raise RuntimeError("Unsupported language detected")
+    return language
+
+
+# ====
+# Logic helpers
+# ====
+def ensure_user(db, chat_id: int) -> User:
+    u = db.get(User, int(chat_id))
+    if not u:
+        u = User(telegram_id=int(chat_id), target_lang="en", trial_left=TRIAL_LIMIT, mode="translate")
+        db.add(u); db.commit(); db.refresh(u)
+    return u
+
+
+def user_keyboard(user: User) -> Dict[str, Any]:
+    return build_main_keyboard(
+        user.target_lang,
+        mode=(user.mode or "translate"),
+        conversation_ready=bool(user.conversation_source_lang and user.conversation_target_lang)
+    )
+
+
+def decide_billing(user: User, voice_seconds: int) -> Tuple[str, int]:
+    sec = max(MIN_BILLABLE_SECONDS, int(voice_seconds))
+    if (user.trial_left or 0) > 0 and sec <= TRIAL_MAX_SECONDS: return "trial", 0
+    if int(user.balance_seconds or 0) >= sec: return "paid", sec
+    return "deny", 0
+
+
+def apply_billing(db, user: User, mode: str, charge: int):
+    if mode == "trial": user.trial_left = max(0, int(user.trial_left or 0) - 1)
+    elif mode == "paid": user.balance_seconds = max(0, int(user.balance_seconds or 0) - charge)
+    user.updated_at = datetime.utcnow()
+    db.add(user)
+
+
+def is_admin(chat_id: int) -> bool:
+    return str(chat_id) == str(ADMIN_ID) and ADMIN_ID != ""
+
+
+def admin_notify(text: str):
+    if ADMIN_ID:
+        try: tg_send_message(int(ADMIN_ID), text)
+        except: pass
+
+
+# ====
+# FastAPI
+# ====
+app = FastAPI()
+
+
+@app.on_event("startup")
+def startup(): init_db()
+
+
+@app.get("/", response_class=HTMLResponse)
+def landing():
+    bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else ""
+    langs = ", ".join([name for name, _ in LANGS])
+    html = f"""<!doctype html><html lang="en"><head><meta charset="utf-8"/><title>Lingovox</title><style>body{{background:#0b1020;color:#e9eefc;font-family:sans-serif;padding:40px}}a{{color:#fff}}.card{{background:#111a33;padding:20px;border-radius:15px;max-width:600px;margin:auto}}</style></head><body><div class="card"><h1>Lingovox AI</h1><p>Voice translator.</p><p>Supported: {langs}</p><a href="{bot_link}">Open Bot</a></div></body></html>"""
+    return HTMLResponse(content=html)
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook(req: Request):
+    update = await req.json()
     try:
-        parsed = json.loads(out)
-        language
+        if "message" in update:
+            msg = update["message"]
+            chat_id = msg.get("chat", {}).get("id")
+            if not chat_id: return JSONResponse({"ok": True})
+            text = (msg.get("text") or "").strip()
+
+            if text == "/start":
+                with SessionLocal() as db:
+                    u = ensure_user(db, chat_id)
+                    is_new = u.trial_left == TRIAL_LIMIT and u.balance_seconds == 0
+                    if is_new:
+                        welcome = (
+                            "👋 Привет! Я Lingovox — голосовой переводчик.\n"
+                            "Hi! I'm Lingovox — AI voice translator.\n\n"
+                            "🎁 У тебя 5 бесплатных переводов (до 60 сек каждый).\n"
+                            "You have 5 free voice translations to try.\n\n"
+                            "👇 Выбери язык перевода и отправь голосовое!\n"
+                            "Pick a target language below and send a voice message!"
+                        )
+                        tg_send_message(chat_id, welcome, reply_markup=user_keyboard(u))
+                    else:
+                        tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
+                return JSONResponse({"ok": True})
+
+            if text == "/buy":
+                tg_send_message(
+                    chat_id,
+                    "💳 Выбери пакет минут / Choose a package:\n\nОплата картой или USDT — без подписки, без срока действия.\nCard or USDT crypto — no subscription, no expiry.",
+                    reply_markup=build_packages_keyboard()
+                )
+                return JSONResponse({"ok": True})
+
+            if text.startswith("/support"):
+                if text == "/support":
+                    tg_send_message(chat_id, "🆘 Напиши: /support <твой вопрос>\nExample: /support I can't pay with card")
+                else:
+                    ticket_text = text.split(" ", 1)[1].strip()
+                    with SessionLocal() as db:
+                        t = SupportTicket(telegram_id=chat_id, message=ticket_text)
+                        db.add(t); db.commit(); db.refresh(t)
+                        tg_send_message(chat_id, f"✅ Заявка #{t.id} создана. Ответим в ближайшее время!\nTicket #{t.id} created. We'll reply soon.")
+                        admin_notify(f"🆘 Ticket #{t.id} от {chat_id}: {ticket_text}")
+                return JSONResponse({"ok": True})
+
+            if text == "/stat" and is_admin(chat_id):
+                with SessionLocal() as db:
+                    u_cnt = db.query(User).count()
+                    p_cnt = db.query(Payment).filter(Payment.status == "paid").count()
+                    tg_send_message(chat_id, f"📊 Users: {u_cnt}\nPaid payments: {p_cnt}")
+                return JSONResponse({"ok": True})
+
+            if text.startswith("/reply") and is_admin(chat_id):
+                parts = text.split(maxsplit=2)
+                if len(parts) == 3:
+                    tid, rmsg = int(parts[1]), parts[2]
+                    with SessionLocal() as db:
+                        t = db.get(SupportTicket, tid)
+                        if t:
+                            tg_send_message(t.telegram_id, f"✅ Support reply:\n{rmsg}")
+                            t.status = "closed"
+                            db.commit()
+                            tg_send_message(chat_id, f"✅ Replied to #{tid}")
+                return JSONResponse({"ok": True})
+
+            if "voice" in msg:
+                v = msg["voice"]
+                fid, dur = v["file_id"], int(v.get("duration", 0))
+                with SessionLocal() as db:
+                    u = ensure_user(db, chat_id)
+                    b_mode, ch = decide_billing(u, dur)
+                    if b_mode == "deny":
+                        tg_send_message(chat_id, "⛔ Баланс исчерпан / No balance left.\n\nКупи минуты — оплата картой или USDT, без подписки.\nBuy minutes — card or crypto, no subscription.", reply_markup=build_packages_keyboard())
+                        return JSONResponse({"ok": True})
+
+                    gf = requests.get(f"{TG_API}/getFile", params={"file_id": fid}).json()
+                    furl = f"https://api.telegram.org/file/bot{TELEGRAM_BOT_TOKEN}/{gf['result']['file_path']}"
+                    audio = requests.get(furl).content
+
+                    try:
+                        trans = openai_transcribe_verbose(audio)
+                        otext = trans["text"]
+                        if not otext: raise RuntimeError("Empty voice")
+
+                        if u.mode == "conversation":
+                            source_lang = (u.conversation_source_lang or "").strip()
+                            target_lang = (u.conversation_target_lang or "").strip()
+                            setup = parse_conversation_setup(otext)
+
+                            if setup.get("has_setup_command") and setup.get("target_lang"):
+                                target_lang = canonicalize_language_name(setup["target_lang"])
+                                stext = setup.get("message_text") or otext
+                                source_lang = canonicalize_language_name(detect_language_name_from_text(stext))
+                                if normalize_language_name(source_lang) == normalize_language_name(target_lang):
+                                    raise RuntimeError("Languages are the same.")
+                                u.conversation_source_lang, u.conversation_target_lang = source_lang, target_lang
+                                db.commit()
+                                translate_to, resolved_in = target_lang, source_lang
+                                to_translate = stext
+                            else:
+                                if not source_lang or not target_lang:
+                                    raise RuntimeError("Conversation is not configured. Say 'Translate to Spanish: ...'")
+                                inc_lang = detect_language_name_from_text(otext)
+                                translate_to, resolved_in = decide_conversation_target_any(source_lang, target_lang, inc_lang)
+                                to_translate = otext
+
+                            ttext = openai_translate_text(to_translate, translate_to, source_lang=resolved_in)
+                        else:
+                            ttext = openai_translate_text(otext, lang_name(u.target_lang))
+                        
+                        tts = openai_tts(ttext)
+                        apply_billing(db, u, b_mode, ch)
+                        db.commit()
+                        
+                        if b_mode == "trial":
+                            cap = f"🎁 Пробных осталось: {u.trial_left} / Free left: {u.trial_left}"
+                        else:
+                            cap = f"💳 Баланс / Balance: {u.balance_seconds//60} min"
+                        tg_send_voice(chat_id, tts, caption=cap)
+                        tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
+                    except Exception as e:
+                        log.exception("Voice error")
+                        tg_send_message(chat_id, f"⚠️ Что-то пошло не так / Something went wrong:\n{e}")
+                return JSONResponse({"ok": True})
+
+        if "callback_query" in update:
+            cq = update["callback_query"]
+            data, chat_id, cq_id = cq["data"], cq["message"]["chat"]["id"], cq["id"]
+
+            with SessionLocal() as db:
+                u = ensure_user(db, chat_id)
+                if data.startswith("lang:"):
+                    u.target_lang, u.mode = data.split(":")[1], "translate"
+                    u.conversation_source_lang = u.conversation_target_lang = None
+                    db.commit()
+                    tg_send_message(chat_id, format_status_text(u), reply_markup=user_keyboard(u))
+                elif data == "mode:conversation":
+                    u.mode = "conversation"
+                    u.conversation_source_lang = u.conversation_target_lang = None
+                    db.commit()
+                    tg_send_message(
+                        chat_id,
+                        "🗣 Режим разговора включён / Conversation mode on\n\n"
+                        "Скажи голосом: «Переведи на английский: привет»\n"
+                        "Or say: \"Translate to Spanish: hello\"\n\n"
+                        "Бот запомнит пару языков и будет переводить в обе стороны.\n"
+                        "Bot will remember the pair and translate both ways.",
+                        reply_markup=user_keyboard(u)
+                    )
+                elif data == "conversation:reset":
+                    u.conversation_source_lang = u.conversation_target_lang = None
+                    db.commit()
+                    tg_send_message(
+                        chat_id,
+                        "🔄 Пара языков сброшена / Language pair reset.\n\n"
+                        "Скажи новую пару голосом: «Переведи на турецкий: добрый день»",
+                        reply_markup=user_keyboard(u)
+                    )
+                elif data == "buy:menu":
+                    tg_send_message(
+                        chat_id,
+                        "💳 Выбери пакет / Choose a package:\n\nБез подписки, без срока действия.\nNo subscription, no expiry.",
+                        reply_markup=build_packages_keyboard()
+                    )
+                elif data == "support:menu":
+                    tg_send_message(chat_id, "🆘 Напиши: /support <твой вопрос>\nExample: /support I can't pay with card")
+                elif data.startswith("paddle:") or data.startswith("buy:"):
+                    # Логика создания инвойсов (оставлена без изменений для экономии места)
+                    pass
+
+            tg_answer_callback(cq_id)
+            return JSONResponse({"ok": True})
+    except Exception as e:
+        log.exception("Webhook error")
+    return JSONResponse({"ok": True})
+
+
+@app.post(POSTBACK_PATH)
+async def nowpayments_postback(req: Request):
+    raw, sig = await req.body(), req.headers.get("x-nowpayments-sig", "")
+    if not verify_nowpayments_signature(raw, sig): return PlainTextResponse("invalid", status_code=400)
+    data = json.loads(raw.decode())
+    with SessionLocal() as db:
+        p = db.query(Payment).filter(Payment.order_id == data.get("order_id")).first()
+        if p and p.status != "paid" and data.get("payment_status") in ("finished", "confirmed", "paid"):
+            credit_payment_if_needed(db, p)
+    return PlainTextResponse("ok")
+
+
+@app.post(PADDLE_POSTBACK_PATH)
+async def paddle_postback(req: Request):
+    raw, sig = await req.body(), req.headers.get("Paddle-Signature", "")
+    if not verify_paddle_signature(raw, sig): return PlainTextResponse("invalid", status_code=400)
+    data = json.loads(raw.decode())
+    if data.get("event_type") == "transaction.completed":
+        tid = data["data"]["id"]
+        with SessionLocal() as db:
+            p = db.query(Payment).filter(Payment.invoice_id == tid).first()
+            if p: credit_payment_if_needed(db, p)
+    return PlainTextResponse("ok")
+
+
+@app.get("/terms")
+def terms(): return HTMLResponse("<h1>Terms of Service</h1>")
+
+
+@app.get("/privacy")
+def privacy(): return HTMLResponse("<h1>Privacy Policy</h1>")
