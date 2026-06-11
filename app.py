@@ -42,6 +42,9 @@ BOT_USERNAME = os.getenv("BOT_USERNAME", "").strip().lstrip("@")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini").strip()
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
+# Распознавание речи: основной движок и запасной (включается, если основной выдал кашу)
+STT_MODEL = os.getenv("STT_MODEL", "whisper-1").strip()
+STT_FALLBACK_MODEL = os.getenv("STT_FALLBACK_MODEL", "gpt-4o-transcribe").strip()
 
 # ---- Payments (только карта через Paddle) ----
 PADDLE_API_KEY = os.getenv("PADDLE_API_KEY", "").strip()
@@ -530,16 +533,16 @@ def _openai_post(url: str, *, json_body: Dict[str, Any], timeout: int = REQUEST_
     raise RuntimeError(f"OpenAI request failed: {last_err}")
 
 
-def openai_transcribe(ogg_bytes: bytes) -> str:
+def openai_transcribe(ogg_bytes: bytes, model: str = "whisper-1") -> str:
     url = "https://api.openai.com/v1/audio/transcriptions"
     files = {
         "file": ("audio.ogg", ogg_bytes, "audio/ogg"),
-        "model": (None, "whisper-1"),
+        "model": (None, model),
         "response_format": (None, "json"),
     }
     r = requests.post(url, headers=_openai_headers(), files=files, timeout=120)
     if r.status_code != 200:
-        raise RuntimeError(f"Transcription failed: {r.text[:300]}")
+        raise RuntimeError(f"Transcription failed ({model}): {r.text[:300]}")
     return str(r.json().get("text") or "").strip()
 
 
@@ -607,6 +610,33 @@ def transcript_looks_valid(text: str) -> bool:
     except Exception as e:
         log.warning("transcript_looks_valid failed (allowing): %s", e)
         return True
+
+
+def transcribe_with_fallback(audio: bytes, chat_id: int) -> Tuple[str, bool]:
+    """
+    Распознаёт аудио основным движком (Whisper). Если результат — каша,
+    автоматически повторяет на более точном запасном движке (gpt-4o-transcribe).
+    Возвращает (text, ok), где ok=False означает, что и запасной не справился.
+    """
+    # 1) Основной движок
+    text = openai_transcribe(audio, model=STT_MODEL)
+    log.info("Voice from %s: [%s] transcript=%r", chat_id, STT_MODEL, text)
+    if text and transcript_looks_valid(text):
+        return text, True
+
+    # 2) Основной выдал кашу или пусто → пробуем запасной (если он другой)
+    if STT_FALLBACK_MODEL and STT_FALLBACK_MODEL != STT_MODEL:
+        try:
+            text2 = openai_transcribe(audio, model=STT_FALLBACK_MODEL)
+            log.info("Voice from %s: [%s fallback] transcript=%r", chat_id, STT_FALLBACK_MODEL, text2)
+            if text2 and transcript_looks_valid(text2):
+                return text2, True
+            # запасной тоже не уверен — берём его результат как более точный, но помечаем неуспех
+            return (text2 or text), False
+        except Exception as e:
+            log.warning("Fallback STT failed: %s", e)
+
+    return text, False
 
 
 def gpt_parse_setup(text: str) -> Dict[str, str]:
@@ -1018,15 +1048,14 @@ def process_voice(db, user: "User", chat_id: int, file_id: str, duration: int) -
         return
 
     audio = tg_download_voice(file_id)
-    transcript = openai_transcribe(audio)
-    log.info("Voice from %s (%ss): transcript=%r", chat_id, duration, transcript)
+    transcript, ok = transcribe_with_fallback(audio, chat_id)
     if not transcript:
         raise RuntimeError("Empty voice message")
 
-    # Страховка: если Whisper выдал кашу (спутал язык / шум) — не переводим мусор,
-    # а честно просим повторить. Биллинг при этом НЕ списываем.
-    if not transcript_looks_valid(transcript):
-        log.info("Voice from %s: transcript rejected as gibberish", chat_id)
+    # Если ни основной, ни запасной движок не дали осмысленного текста —
+    # не переводим мусор, честно просим повторить. Биллинг НЕ списываем.
+    if not ok:
+        log.info("Voice from %s: transcript rejected after fallback", chat_id)
         tg_send_message(chat_id, t("voice_unclear", ui_of(user)), reply_markup=user_keyboard(user))
         return
 
