@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import re
 from datetime import datetime, timedelta
+from collections import OrderedDict
 from typing import Optional, Dict, Any, Tuple, List
 
 import requests
@@ -582,16 +583,21 @@ def transcript_looks_valid(text: str) -> bool:
         return True
     url = "https://api.openai.com/v1/chat/completions"
     prompt = (
-        "You check speech-to-text output for quality. "
-        "Return ONLY JSON {\"ok\": true} if the text is a coherent, meaningful phrase "
-        "in some real language. Return {\"ok\": false} if it's gibberish, a random mix of "
-        "words that don't form meaning, or clearly garbled transcription.\n\n"
+        "You are a strict quality checker for speech-to-text output. "
+        "Decide if the text is a coherent, meaningful utterance in ONE real language.\n"
+        "Return {\"ok\": false} if ANY of these are true:\n"
+        "- it mixes words from several languages in a way that makes no sense;\n"
+        "- it contains made-up or garbled word-forms;\n"
+        "- it reads as random or broken transcription rather than a real sentence.\n"
+        "Return {\"ok\": true} ONLY if it is clearly a normal, meaningful phrase.\n"
+        "Return ONLY JSON like {\"ok\": true} or {\"ok\": false}.\n\n"
         f"Text:\n{t}"
     )
     body = {
         "model": OPENAI_TEXT_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "response_format": {"type": "json_object"},
+        "temperature": 0,
         "max_tokens": 20,
     }
     try:
@@ -1383,11 +1389,33 @@ def blog_post(slug: str):
     return HTMLResponse(content=_page(post["title"], body))
 
 
+_processed_updates: "OrderedDict[int, float]" = OrderedDict()
+_PROCESSED_MAX = 2000
+
+
+def _already_processed(update_id: Optional[int]) -> bool:
+    """Защита от повторной доставки одного и того же update от Telegram."""
+    if update_id is None:
+        return False
+    if update_id in _processed_updates:
+        return True
+    _processed_updates[update_id] = time.time()
+    # Не даём множеству расти бесконечно
+    while len(_processed_updates) > _PROCESSED_MAX:
+        _processed_updates.popitem(last=False)
+    return False
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
     try:
         update = await req.json()
     except Exception:
+        return JSONResponse({"ok": True})
+
+    # Telegram повторяет доставку, если не дождался ответа — игнорируем дубли
+    if _already_processed(update.get("update_id")):
+        log.info("Duplicate update %s ignored", update.get("update_id"))
         return JSONResponse({"ok": True})
 
     try:
