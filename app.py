@@ -43,8 +43,8 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-4o-mini").strip()
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
 # Распознавание речи: основной движок и запасной (включается, если основной выдал кашу)
-STT_MODEL = os.getenv("STT_MODEL", "whisper-1").strip()
-STT_FALLBACK_MODEL = os.getenv("STT_FALLBACK_MODEL", "gpt-4o-transcribe").strip()
+STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe").strip()
+STT_FALLBACK_MODEL = os.getenv("STT_FALLBACK_MODEL", "whisper-1").strip()
 
 # ---- Payments (только карта через Paddle) ----
 PADDLE_API_KEY = os.getenv("PADDLE_API_KEY", "").strip()
@@ -613,27 +613,35 @@ def transcript_looks_valid(text: str) -> bool:
         return True
 
 
+def _is_accurate_model(model: str) -> bool:
+    """Точные модели, чьему результату доверяем без придирчивой проверки."""
+    return "gpt-4o" in (model or "").lower()
+
+
 def transcribe_with_fallback(audio: bytes, chat_id: int) -> Tuple[str, bool]:
     """
-    Распознаёт аудио основным движком (Whisper). Если результат — каша,
-    автоматически повторяет на более точном запасном движке (gpt-4o-transcribe).
-    Возвращает (text, ok), где ok=False означает, что и запасной не справился.
+    Распознаёт аудио основным движком. Если основной — точная модель (gpt-4o),
+    доверяем её результату сразу. Если основной — Whisper и он выдал кашу,
+    автоматически повторяем на запасном движке.
+    Возвращает (text, ok), где ok=False означает, что осмысленный текст получить не удалось.
     """
     # 1) Основной движок
     text = openai_transcribe(audio, model=STT_MODEL)
     log.info("Voice from %s: [%s] transcript=%r", chat_id, STT_MODEL, text)
-    if text and transcript_looks_valid(text):
-        return text, True
+    if text:
+        # Точной модели доверяем без проверки; иначе проверяем на кашу
+        if _is_accurate_model(STT_MODEL) or transcript_looks_valid(text):
+            return text, True
 
-    # 2) Основной выдал кашу или пусто → пробуем запасной (если он другой)
+    # 2) Основной пуст или выдал кашу → пробуем запасной (если он другой)
     if STT_FALLBACK_MODEL and STT_FALLBACK_MODEL != STT_MODEL:
         try:
             text2 = openai_transcribe(audio, model=STT_FALLBACK_MODEL)
             log.info("Voice from %s: [%s fallback] transcript=%r", chat_id, STT_FALLBACK_MODEL, text2)
-            if text2 and transcript_looks_valid(text2):
-                return text2, True
-            # запасной тоже не уверен — берём его результат как более точный, но помечаем неуспех
-            return (text2 or text), False
+            if text2:
+                if _is_accurate_model(STT_FALLBACK_MODEL) or transcript_looks_valid(text2):
+                    return text2, True
+                return text2, False
         except Exception as e:
             log.warning("Fallback STT failed: %s", e)
 
