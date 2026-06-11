@@ -254,6 +254,10 @@ STRINGS: Dict[str, Dict[str, str]] = {
         "en": "🎙 Send me a voice message to translate. Tap ℹ️ Help for options.",
         "ru": "🎙 Отправьте голосовое для перевода. Нажмите ℹ️ Помощь для подсказок.",
     },
+    "voice_unclear": {
+        "en": "🤔 Couldn't make out the audio clearly — it may be noisy or in a hard-to-recognize language. Try recording again, a bit slower and clearer. (You weren't charged.)",
+        "ru": "🤔 Не удалось разобрать аудио — возможно, шумно или язык трудно распознаётся. Попробуйте записать ещё раз, чуть медленнее и чётче. (Списание не произошло.)",
+    },
     "pay_card_link": {"en": "💳 Pay with card:\n{url}", "ru": "💳 Оплата картой:\n{url}"},
     "pay_received": {
         "en": "✅ Payment received!\nCredited: {min} min",
@@ -563,6 +567,40 @@ def openai_translate_text(text: str, target_lang: str, source_lang: Optional[str
     body = {"model": OPENAI_TEXT_MODEL, "messages": [{"role": "user", "content": prompt}]}
     r = _openai_post(url, json_body=body)
     return r.json()["choices"][0]["message"]["content"].strip()
+
+
+def transcript_looks_valid(text: str) -> bool:
+    """
+    Лёгкая проверка: осмысленный ли распознанный текст, или это каша
+    (Whisper спутал язык / шум). Дешёвый вызов gpt-4o-mini.
+    Возвращает True если текст связный, False если мусор.
+    При ошибке проверки возвращает True (не блокируем по сбою сети).
+    """
+    t = (text or "").strip()
+    # Совсем короткое — не гоняем проверку, пропускаем
+    if len(t) < 8:
+        return True
+    url = "https://api.openai.com/v1/chat/completions"
+    prompt = (
+        "You check speech-to-text output for quality. "
+        "Return ONLY JSON {\"ok\": true} if the text is a coherent, meaningful phrase "
+        "in some real language. Return {\"ok\": false} if it's gibberish, a random mix of "
+        "words that don't form meaning, or clearly garbled transcription.\n\n"
+        f"Text:\n{t}"
+    )
+    body = {
+        "model": OPENAI_TEXT_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 20,
+    }
+    try:
+        r = _openai_post(url, json_body=body, timeout=30)
+        out = json.loads(r.json()["choices"][0]["message"]["content"])
+        return bool(out.get("ok", True))
+    except Exception as e:
+        log.warning("transcript_looks_valid failed (allowing): %s", e)
+        return True
 
 
 def gpt_parse_setup(text: str) -> Dict[str, str]:
@@ -978,6 +1016,13 @@ def process_voice(db, user: "User", chat_id: int, file_id: str, duration: int) -
     log.info("Voice from %s (%ss): transcript=%r", chat_id, duration, transcript)
     if not transcript:
         raise RuntimeError("Empty voice message")
+
+    # Страховка: если Whisper выдал кашу (спутал язык / шум) — не переводим мусор,
+    # а честно просим повторить. Биллинг при этом НЕ списываем.
+    if not transcript_looks_valid(transcript):
+        log.info("Voice from %s: transcript rejected as gibberish", chat_id)
+        tg_send_message(chat_id, t("voice_unclear", ui_of(user)), reply_markup=user_keyboard(user))
+        return
 
     if (user.mode or "translate") == "conversation":
         translated, used_caption = _process_conversation_voice(db, user, transcript)
