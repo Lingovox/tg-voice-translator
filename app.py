@@ -538,12 +538,23 @@ def openai_transcribe(ogg_bytes: bytes, model: str = "whisper-1") -> str:
     files = {
         "file": ("audio.ogg", ogg_bytes, "audio/ogg"),
         "model": (None, model),
-        "response_format": (None, "json"),
     }
+    if "gpt-4o" in (model or "").lower():
+        # У gpt-4o-transcribe бывает обрезка длинного аудио. Формат text + авто-чанкинг
+        # заставляют модель обработать запись целиком, а не первые секунды.
+        files["response_format"] = (None, "text")
+        files["chunking_strategy"] = (None, "auto")
+    else:
+        files["response_format"] = (None, "json")
+
     r = requests.post(url, headers=_openai_headers(), files=files, timeout=120)
     if r.status_code != 200:
         raise RuntimeError(f"Transcription failed ({model}): {r.text[:300]}")
-    return str(r.json().get("text") or "").strip()
+    # text-формат возвращает чистый текст, json — поле text
+    ctype = (r.headers.get("content-type") or "").lower()
+    if "application/json" in ctype:
+        return str(r.json().get("text") or "").strip()
+    return (r.text or "").strip()
 
 
 def openai_tts(text: str) -> bytes:
