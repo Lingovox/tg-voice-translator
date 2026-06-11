@@ -586,13 +586,14 @@ def transcript_looks_valid(text: str) -> bool:
         return True
     url = "https://api.openai.com/v1/chat/completions"
     prompt = (
-        "You are a strict quality checker for speech-to-text output. "
-        "Decide if the text is a coherent, meaningful utterance in ONE real language.\n"
-        "Return {\"ok\": false} if ANY of these are true:\n"
-        "- it mixes words from several languages in a way that makes no sense;\n"
-        "- it contains made-up or garbled word-forms;\n"
-        "- it reads as random or broken transcription rather than a real sentence.\n"
-        "Return {\"ok\": true} ONLY if it is clearly a normal, meaningful phrase.\n"
+        "You check speech-to-text output. The text may be in ANY language "
+        "(including less common ones like Uzbek, Kazakh, Georgian) and may be short. "
+        "Most text is fine — your job is only to catch CLEARLY BROKEN transcription.\n"
+        "Return {\"ok\": false} ONLY if the text is obvious gibberish: a chaotic mix of "
+        "fragments from different languages that together form no meaning, or strings of "
+        "non-existent word-forms. When unsure, return {\"ok\": true}.\n"
+        "A normal, meaningful sentence in any single language is ALWAYS {\"ok\": true}, "
+        "even if short or in a rare language.\n"
         "Return ONLY JSON like {\"ok\": true} or {\"ok\": false}.\n\n"
         f"Text:\n{t}"
     )
