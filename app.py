@@ -1455,6 +1455,68 @@ def _already_processed(update_id: Optional[int]) -> bool:
     return False
 
 
+@app.get("/pay", response_class=HTMLResponse)
+def pay_page(request: Request):
+    """Страница оплаты: открывает Paddle-чекаут по _ptxn из URL.
+    Paddle сам добавляет ?_ptxn=transaction_id к checkout.url."""
+    ptxn = (request.query_params.get("_ptxn") or "").strip()
+    paddle_env_js = "sandbox" if PADDLE_ENV != "live" else "production"
+    bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "#"
+
+    if not ptxn or not PADDLE_CLIENT_TOKEN:
+        body = """
+<div class="hero">
+  <h1>Payment link error</h1>
+  <p>This payment link is missing or invalid. Please go back to the bot and tap a package again.</p>
+  <a class="btn" href="%s">Back to Lingovox</a>
+</div>""" % bot_link
+        return HTMLResponse(content=_page("Payment", body), status_code=400)
+
+    # Страница с Paddle.js: инициализируем и сразу открываем чекаут по transactionId.
+    html = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Lingovox — Checkout</title>
+<style>
+  body {{ font-family: -apple-system, Segoe UI, Roboto, sans-serif; background:#0f1f17;
+         color:#e8f0ea; display:flex; min-height:100vh; align-items:center;
+         justify-content:center; margin:0; text-align:center; padding:24px; }}
+  .box {{ max-width:420px; }}
+  h1 {{ font-size:20px; margin-bottom:8px; }}
+  p {{ opacity:.8; line-height:1.5; }}
+  a {{ color:#7fd1a8; }}
+  .spin {{ margin:20px auto; width:34px; height:34px; border:3px solid #2c4a3a;
+           border-top-color:#7fd1a8; border-radius:50%; animation:r 1s linear infinite; }}
+  @keyframes r {{ to {{ transform:rotate(360deg); }} }}
+</style>
+<script src="https://cdn.paddle.com/paddle/v2/paddle.js"></script>
+</head>
+<body>
+<div class="box">
+  <div class="spin"></div>
+  <h1>Opening secure checkout…</h1>
+  <p id="msg">If the payment window doesn't appear, <a href="#" onclick="openCheckout();return false;">tap here</a>.
+  Having trouble? <a href="{bot_link}">Return to the bot</a>.</p>
+</div>
+<script>
+  function openCheckout() {{
+    try {{
+      Paddle.Checkout.open({{ transactionId: "{ptxn}" }});
+    }} catch (e) {{
+      document.getElementById('msg').textContent = 'Could not open checkout. Please return to the bot and try again.';
+    }}
+  }}
+  Paddle.Environment.set("{paddle_env_js}");
+  Paddle.Initialize({{ token: "{PADDLE_CLIENT_TOKEN}" }});
+  window.addEventListener('load', openCheckout);
+</script>
+</body>
+</html>"""
+    return HTMLResponse(content=html)
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(req: Request):
     try:
