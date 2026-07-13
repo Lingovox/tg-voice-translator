@@ -1740,7 +1740,6 @@ async def whatsapp_webhook(request: Request):
 
     log.info(f"WhatsApp webhook incoming: {json.dumps(data, ensure_ascii=False)}")
 
-    # Извлекаем сообщения из payload
     try:
         entries = data.get("entry", [])
         for entry in entries:
@@ -1751,9 +1750,159 @@ async def whatsapp_webhook(request: Request):
                     wa_phone = message.get("from")
                     msg_type = message.get("type")
                     log.info(f"WhatsApp message from {wa_phone}: type={msg_type}")
-                    # TODO: обработка сообщений (следующий шаг)
+                    wa_handle_message(wa_phone, message)
     except Exception as e:
         log.error(f"WhatsApp webhook processing error: {e}")
 
-    # Meta ожидает 200 OK в любом случае
     return PlainTextResponse("ok")
+
+
+# =========================================================
+# WhatsApp — helpers и логика
+# =========================================================
+
+def wa_send_text(to: str, text: str) -> None:
+    """Отправить текстовое сообщение."""
+    if not WA_TOKEN or not WA_PHONE_ID:
+        log.warning("WA_TOKEN or WA_PHONE_ID not set, skipping wa_send_text")
+        return
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text},
+    }
+    resp = requests.post(
+        WA_API_URL,
+        headers={"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not resp.ok:
+        log.error(f"wa_send_text error {resp.status_code}: {resp.text}")
+
+
+def wa_send_buttons(to: str, body: str, buttons: list) -> None:
+    """Отправить сообщение с Reply Buttons (макс. 3 кнопки, 20 символов каждая)."""
+    if not WA_TOKEN or not WA_PHONE_ID:
+        log.warning("WA_TOKEN or WA_PHONE_ID not set, skipping wa_send_buttons")
+        return
+    # buttons = [{"id": "btn_id", "title": "Button text"}, ...]
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body},
+            "action": {
+                "buttons": [
+                    {"type": "reply", "reply": {"id": b["id"], "title": b["title"][:20]}}
+                    for b in buttons[:3]
+                ]
+            },
+        },
+    }
+    resp = requests.post(
+        WA_API_URL,
+        headers={"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"},
+        json=payload,
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not resp.ok:
+        log.error(f"wa_send_buttons error {resp.status_code}: {resp.text}")
+
+
+def wa_handle_message(wa_phone: str, message: dict) -> None:
+    """Основная точка входа для обработки входящего сообщения WhatsApp."""
+    msg_type = message.get("type")
+
+    # Нажатие на Reply Button
+    if msg_type == "interactive":
+        interactive = message.get("interactive", {})
+        if interactive.get("type") == "button_reply":
+            button_id = interactive["button_reply"]["id"]
+            wa_handle_button(wa_phone, button_id)
+        return
+
+    # Текстовое сообщение — показываем главный экран
+    if msg_type == "text":
+        wa_send_main_menu(wa_phone)
+        return
+
+    # Голосовое сообщение — TODO следующий шаг
+    if msg_type == "audio":
+        wa_send_text(wa_phone, "🎙 Voice message received. Voice translation coming soon!")
+        return
+
+    # Всё остальное игнорируем
+    log.info(f"WhatsApp: unsupported message type {msg_type} from {wa_phone}")
+
+
+def wa_send_main_menu(wa_phone: str) -> None:
+    """Отправить главный экран с тремя кнопками."""
+    wa_send_buttons(
+        to=wa_phone,
+        body=(
+            "👋 Welcome to *LingoVox* — voice translator!\n\n"
+            "Send me a voice message and I'll translate it.\n"
+            "Or choose an option below:"
+        ),
+        buttons=[
+            {"id": "btn_meeting", "title": "👥 Live Meeting"},
+            {"id": "btn_language", "title": "🌍 Language"},
+            {"id": "btn_help",    "title": "ℹ️ Help"},
+        ],
+    )
+
+
+def wa_handle_button(wa_phone: str, button_id: str) -> None:
+    """Обработка нажатия кнопки."""
+    if button_id == "btn_meeting":
+        wa_send_buttons(
+            to=wa_phone,
+            body=(
+                "👥 *Live Meeting mode*\n\n"
+                "Speak in turns — I'll translate both sides in real time.\n"
+                "Georgian 🇬🇪, Kazakh 🇰🇿, Uzbek 🇺🇿 voice supported!\n\n"
+                "Send a voice message to start."
+            ),
+            buttons=[
+                {"id": "btn_stop",    "title": "⏹ Stop Meeting"},
+                {"id": "btn_swap",    "title": "🔄 Swap langs"},
+                {"id": "btn_back",    "title": "← Back"},
+            ],
+        )
+
+    elif button_id == "btn_language":
+        wa_send_text(
+            wa_phone,
+            "🌍 *Choose your language*\n\n"
+            "Reply with the name of the language you want to translate *to*:\n\n"
+            "• English\n• Russian\n• Georgian\n• Kazakh\n• Uzbek\n"
+            "• Turkish\n• Spanish\n• Arabic\n• Hindi\n• Portuguese\n\n"
+            "Example: just type *Georgian*"
+        )
+
+    elif button_id == "btn_help":
+        wa_send_text(
+            wa_phone,
+            "ℹ️ *How LingoVox works*\n\n"
+            "1️⃣ Send a voice message — I'll detect the language and translate it\n"
+            "2️⃣ You'll get back a translated voice + text\n"
+            "3️⃣ Forward the voice reply to your contact\n\n"
+            "🎙 *Live Meeting mode* — place your phone on the table, "
+            "take turns speaking — I translate both sides in real time\n\n"
+            "🇬🇪 Georgian • 🇰🇿 Kazakh • 🇺🇿 Uzbek voice supported "
+            "(Google Translate doesn't support these!)\n\n"
+            "Questions? Contact @arkhipov_stepan"
+        )
+
+    elif button_id in ("btn_stop", "btn_back"):
+        wa_send_main_menu(wa_phone)
+
+    elif button_id == "btn_swap":
+        wa_send_text(wa_phone, "🔄 Languages swapped! Send a voice message to continue.")
+
+    else:
+        log.warning(f"WhatsApp: unknown button_id={button_id} from {wa_phone}")
