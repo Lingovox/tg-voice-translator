@@ -1982,6 +1982,19 @@ def wa_process_voice(wa_phone: str, message: dict) -> None:
         wa_send_main_menu(wa_phone)
 
 
+def wa_set_language(wa_phone: str, lang_code: str) -> None:
+    """Сохранить выбранный язык и подтвердить пользователю."""
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.wa_phone == wa_phone).first()
+        if user:
+            user.target_lang = lang_code
+            user.updated_at = datetime.utcnow()
+            db.commit()
+    lang_display = lang_name(lang_code)
+    wa_send_text(wa_phone, f"✅ Target language set to *{lang_display}*\n\nNow send me a voice message to translate!")
+    wa_send_main_menu(wa_phone)
+
+
 def wa_handle_message(wa_phone: str, message: dict) -> None:
     """Основная точка входа для обработки входящего сообщения WhatsApp."""
     msg_type = message.get("type")
@@ -1994,9 +2007,14 @@ def wa_handle_message(wa_phone: str, message: dict) -> None:
             wa_handle_button(wa_phone, button_id)
         return
 
-    # Текстовое сообщение — показываем главный экран
+    # Текстовое сообщение
     if msg_type == "text":
-        wa_send_main_menu(wa_phone)
+        text = message.get("text", {}).get("body", "").strip()
+        lang_code = find_language_code_in_text(text)
+        if lang_code:
+            wa_set_language(wa_phone, lang_code)
+        else:
+            wa_send_main_menu(wa_phone)
         return
 
     # Голосовое сообщение
