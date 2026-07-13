@@ -1991,7 +1991,7 @@ def wa_set_language(wa_phone: str, lang_code: str) -> None:
             user.updated_at = datetime.utcnow()
             db.commit()
     lang_display = lang_name(lang_code)
-    wa_send_text(wa_phone, f"✅ Target language set to *{lang_display}*\n\nNow send me a voice message to translate!")
+    wa_send_text(wa_phone, f"✅ Target language set to *{lang_display}*\n\n🎙 Ready! Hold the 🎤 button at the bottom of the screen to record a voice message — I'll translate it instantly.")
     wa_send_main_menu(wa_phone)
 
 
