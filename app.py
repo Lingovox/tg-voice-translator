@@ -63,6 +63,12 @@ MIN_BILLABLE_SECONDS = int(os.getenv("MIN_BILLABLE_SECONDS", "1"))
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "90"))
 
+# ---- WhatsApp Cloud API ----
+WA_TOKEN = os.getenv("WA_TOKEN", "").strip()
+WA_PHONE_ID = os.getenv("WA_PHONE_ID", "").strip()
+WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "lingovox_wa_verify_2024").strip()
+WA_API_URL = f"https://graph.facebook.com/v19.0/{WA_PHONE_ID}/messages"
+
 # Смещение часового пояса для границы "сегодня" в статистике (Ташкент = +5)
 STAT_TZ_OFFSET = int(os.getenv("STAT_TZ_OFFSET", "5"))
 
@@ -1695,4 +1701,59 @@ async def paddle_postback(req: Request):
             p = db.query(Payment).filter(Payment.invoice_id == tid).first()
             if p:
                 credit_payment_if_needed(db, p)
+    return PlainTextResponse("ok")
+
+
+# =========================================================
+# WhatsApp Cloud API — Webhook
+# =========================================================
+
+@app.get("/whatsapp/webhook")
+async def whatsapp_webhook_verify(
+    request: Request,
+    hub_mode: str = None,
+    hub_challenge: str = None,
+    hub_verify_token: str = None,
+):
+    """Верификация webhook со стороны Meta."""
+    # FastAPI не принимает алиасы с точкой напрямую, читаем из query вручную
+    params = dict(request.query_params)
+    mode = params.get("hub.mode")
+    challenge = params.get("hub.challenge")
+    verify_token = params.get("hub.verify_token")
+
+    if mode == "subscribe" and verify_token == WA_VERIFY_TOKEN:
+        log.info("WhatsApp webhook verified successfully")
+        return PlainTextResponse(challenge)
+
+    log.warning(f"WhatsApp webhook verification failed: mode={mode}, token={verify_token}")
+    return PlainTextResponse("Forbidden", status_code=403)
+
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    """Приём входящих сообщений от WhatsApp."""
+    try:
+        data = await request.json()
+    except Exception:
+        return PlainTextResponse("bad json", status_code=400)
+
+    log.info(f"WhatsApp webhook incoming: {json.dumps(data, ensure_ascii=False)}")
+
+    # Извлекаем сообщения из payload
+    try:
+        entries = data.get("entry", [])
+        for entry in entries:
+            for change in entry.get("changes", []):
+                value = change.get("value", {})
+                messages = value.get("messages", [])
+                for message in messages:
+                    wa_phone = message.get("from")
+                    msg_type = message.get("type")
+                    log.info(f"WhatsApp message from {wa_phone}: type={msg_type}")
+                    # TODO: обработка сообщений (следующий шаг)
+    except Exception as e:
+        log.error(f"WhatsApp webhook processing error: {e}")
+
+    # Meta ожидает 200 OK в любом случае
     return PlainTextResponse("ok")
