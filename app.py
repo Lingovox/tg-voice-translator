@@ -326,6 +326,9 @@ class User(Base):
     # В режиме conversation храним коды языков из списка LANGS
     conversation_source_lang = Column(String, nullable=True)
     conversation_target_lang = Column(String, nullable=True)
+    # WhatsApp поля (nullable — Telegram-юзеры их не используют)
+    platform = Column(String, nullable=True, default="tg")   # "tg" | "wa"
+    wa_phone = Column(String, nullable=True, index=True)     # номер 998901234567
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -376,6 +379,8 @@ def init_db():
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS trial_messages INTEGER DEFAULT 0")
         conn.exec_driver_sql("ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider VARCHAR DEFAULT 'paddle'")
         conn.exec_driver_sql("ALTER TABLE payments ADD COLUMN IF NOT EXISTS external_id VARCHAR")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS platform VARCHAR DEFAULT 'tg'")
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS wa_phone VARCHAR")
 
 
 # =========================================================
@@ -1813,6 +1818,170 @@ def wa_send_buttons(to: str, body: str, buttons: list) -> None:
         log.error(f"wa_send_buttons error {resp.status_code}: {resp.text}")
 
 
+def wa_download_audio(media_id: str) -> bytes:
+    """Скачать аудиофайл с серверов Meta по media_id."""
+    # Шаг 1 — получаем URL файла
+    url_resp = requests.get(
+        f"https://graph.facebook.com/v19.0/{media_id}",
+        headers={"Authorization": f"Bearer {WA_TOKEN}"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not url_resp.ok:
+        raise RuntimeError(f"wa_download_audio: get url failed {url_resp.status_code}: {url_resp.text[:200]}")
+    download_url = url_resp.json().get("url")
+    if not download_url:
+        raise RuntimeError("wa_download_audio: no url in response")
+
+    # Шаг 2 — скачиваем сам файл
+    file_resp = requests.get(
+        download_url,
+        headers={"Authorization": f"Bearer {WA_TOKEN}"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not file_resp.ok:
+        raise RuntimeError(f"wa_download_audio: download failed {file_resp.status_code}")
+    return file_resp.content
+
+
+def wa_send_audio(to: str, audio_bytes: bytes) -> None:
+    """Отправить голосовое сообщение (ogg/opus) в WhatsApp через upload + send."""
+    if not WA_TOKEN or not WA_PHONE_ID:
+        log.warning("WA_TOKEN or WA_PHONE_ID not set, skipping wa_send_audio")
+        return
+
+    # Шаг 1 — загрузить аудио на сервера Meta
+    upload_resp = requests.post(
+        f"https://graph.facebook.com/v19.0/{WA_PHONE_ID}/media",
+        headers={"Authorization": f"Bearer {WA_TOKEN}"},
+        files={"file": ("voice.ogg", audio_bytes, "audio/ogg; codecs=opus")},
+        data={"messaging_product": "whatsapp"},
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not upload_resp.ok:
+        raise RuntimeError(f"wa_send_audio: upload failed {upload_resp.status_code}: {upload_resp.text[:200]}")
+    media_id = upload_resp.json().get("id")
+    if not media_id:
+        raise RuntimeError("wa_send_audio: no media_id in upload response")
+
+    # Шаг 2 — отправить как voice (не audio — иначе не будет иконки микрофона)
+    send_resp = requests.post(
+        WA_API_URL,
+        headers={"Authorization": f"Bearer {WA_TOKEN}", "Content-Type": "application/json"},
+        json={
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "audio",
+            "audio": {"id": media_id},
+        },
+        timeout=REQUEST_TIMEOUT,
+    )
+    if not send_resp.ok:
+        log.error(f"wa_send_audio: send failed {send_resp.status_code}: {send_resp.text[:200]}")
+
+
+def wa_process_voice(wa_phone: str, message: dict) -> None:
+    """Обработка входящего голосового сообщения от WhatsApp-пользователя."""
+    with SessionLocal() as db:
+        # Получаем или создаём пользователя по wa_phone
+        user = db.query(User).filter(User.wa_phone == wa_phone).first()
+        if not user:
+            # telegram_id — PK NOT NULL, для WA используем отрицательный хэш от номера
+            fake_tg_id = -(abs(hash(wa_phone)) % (10 ** 15))
+            user = User(
+                telegram_id=fake_tg_id,
+                wa_phone=wa_phone,
+                platform="wa",
+                trial_left=TRIAL_LIMIT,
+                trial_messages=0,
+                balance_seconds=0,
+                ui_lang="en",
+                target_lang="ru",  # дефолт — переводить на русский
+                mode="translate",
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+        # Биллинг: duration может отсутствовать в WA, ставим 0 — спишем по факту
+        duration = int(message.get("audio", {}).get("duration") or 0)
+        b_mode, charge = decide_billing(user, duration)
+        if b_mode == "deny":
+            wa_send_text(wa_phone, "⚠️ No balance left. Send *buy* to purchase minutes.")
+            wa_send_main_menu(wa_phone)
+            return
+
+        # Скачиваем аудио
+        media_id = message.get("audio", {}).get("id")
+        if not media_id:
+            wa_send_text(wa_phone, "❌ Could not get audio file. Please try again.")
+            return
+
+        try:
+            audio_bytes = wa_download_audio(media_id)
+        except Exception as e:
+            log.error(f"wa_process_voice: download error: {e}")
+            wa_send_text(wa_phone, "❌ Could not download audio. Please try again.")
+            return
+
+        # STT — транскрибируем
+        try:
+            transcript, ok = transcribe_with_fallback(audio_bytes, 0)
+        except Exception as e:
+            log.error(f"wa_process_voice: STT error: {e}")
+            wa_send_text(wa_phone, "❌ Could not recognize speech. Please try again.")
+            return
+
+        if not transcript:
+            wa_send_text(wa_phone, "❌ Empty voice message. Please try again.")
+            return
+
+        if not ok:
+            wa_send_text(wa_phone, "🔇 Could not understand the audio clearly. Please try again in a quieter environment.")
+            return
+
+        log.info(f"WA voice from {wa_phone}: transcript={transcript!r}")
+
+        # Определяем язык входящего и переводим
+        source_lang = detect_language_name(transcript)
+        target_lang = lang_name(user.target_lang)
+        try:
+            translated = openai_translate_text(transcript, target_lang, source_lang=source_lang)
+        except Exception as e:
+            log.error(f"wa_process_voice: translate error: {e}")
+            wa_send_text(wa_phone, "❌ Translation error. Please try again.")
+            return
+
+        log.info(f"WA voice from {wa_phone}: translated={translated!r}")
+
+        # TTS — синтезируем голос (opus — сразу подходит для WhatsApp ogg)
+        try:
+            tts_bytes = openai_tts(translated)
+        except Exception as e:
+            log.error(f"wa_process_voice: TTS error: {e}")
+            # Отправляем хотя бы текст если TTS упал
+            wa_send_text(wa_phone, f"📝 {transcript}\n➡️ {translated}")
+            return
+
+        # Биллинг
+        apply_billing(db, user, b_mode, charge)
+
+        # Отправляем результат: сначала текст-лог, потом голосовое
+        balance_left = max(0, int(user.balance_seconds or 0)) // 60
+        wa_send_text(
+            wa_phone,
+            f"📝 *{source_lang}:* {transcript}\n"
+            f"➡️ *{target_lang}:* {translated}\n\n"
+            f"⏱ Balance: {balance_left} min"
+        )
+        try:
+            wa_send_audio(wa_phone, tts_bytes)
+        except Exception as e:
+            log.error(f"wa_process_voice: send audio error: {e}")
+
+        # Показываем кнопки после перевода
+        wa_send_main_menu(wa_phone)
+
+
 def wa_handle_message(wa_phone: str, message: dict) -> None:
     """Основная точка входа для обработки входящего сообщения WhatsApp."""
     msg_type = message.get("type")
@@ -1830,9 +1999,9 @@ def wa_handle_message(wa_phone: str, message: dict) -> None:
         wa_send_main_menu(wa_phone)
         return
 
-    # Голосовое сообщение — TODO следующий шаг
+    # Голосовое сообщение
     if msg_type == "audio":
-        wa_send_text(wa_phone, "🎙 Voice message received. Voice translation coming soon!")
+        wa_process_voice(wa_phone, message)
         return
 
     # Всё остальное игнорируем
