@@ -1941,22 +1941,43 @@ def wa_process_voice(wa_phone: str, message: dict) -> None:
 
         log.info(f"WA voice from {wa_phone}: transcript={transcript!r}")
 
-        # Парсим команду из голосового ("переведи на грузинский, как дела?")
+        # Используем ту же логику что в Telegram conversation mode:
+        # первая фраза с командой задаёт пару, дальше направление меняется автоматически
         setup = parse_conversation_setup(transcript)
+
         if setup["has_command"] and setup["target_lang"]:
+            # Команда "переведи на X, фраза" — задаём пару языков
+            new_target = setup["target_lang"]
             text_to_translate = setup["message_text"] or transcript
-            target_lang = setup["target_lang"]
-            # Сохраняем новый target_lang в БД
-            norm = normalize_lang_code(target_lang)
-            if norm:
-                user.target_lang = norm
-                user.updated_at = datetime.utcnow()
-                db.commit()
-        else:
+            new_source = detect_language_name(text_to_translate)
+            if not new_source or _norm_name(new_source) == _norm_name(new_target):
+                new_source = "English" if _norm_name(new_target) != "english" else "Russian"
+            # Сохраняем пару в БД
+            user.conversation_source_lang = new_source
+            user.conversation_target_lang = new_target
+            user.updated_at = datetime.utcnow()
+            db.commit()
+            log.info(f"WA conversation pair set: {new_source} -> {new_target}")
+            source_lang = new_source
+            target_lang = new_target
+
+        elif user.conversation_source_lang and user.conversation_target_lang:
+            # Пара уже задана — определяем направление по языку входящего
+            incoming = detect_language_name(transcript)
+            target_lang, source_lang = resolve_conversation_direction(
+                user.conversation_source_lang,
+                user.conversation_target_lang,
+                incoming,
+            )
             text_to_translate = transcript
+            log.info(f"WA conversation route: incoming={incoming} -> {target_lang}")
+
+        else:
+            # Пара не задана, команды нет — обычный перевод на target_lang
+            text_to_translate = transcript
+            source_lang = detect_language_name(transcript)
             target_lang = lang_name(user.target_lang)
 
-        source_lang = detect_language_name(text_to_translate)
         try:
             translated = openai_translate_text(text_to_translate, target_lang, source_lang=source_lang)
         except Exception as e:
