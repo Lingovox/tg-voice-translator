@@ -2096,12 +2096,12 @@ def wa_handle_button(wa_phone: str, button_id: str) -> None:
         )
 
     elif button_id == "btn_language":
+        lang_list = "\n".join(f"• {name}" for name, _ in LANGS)
         wa_send_text(
             wa_phone,
             "🌍 *Choose your language*\n\n"
             "Reply with the name of the language you want to translate *to*:\n\n"
-            "• English\n• Russian\n• Georgian\n• Kazakh\n• Uzbek\n"
-            "• Turkish\n• Spanish\n• Arabic\n• Hindi\n• Portuguese\n\n"
+            f"{lang_list}\n\n"
             "Example: just type *Georgian*"
         )
 
