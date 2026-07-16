@@ -2092,9 +2092,9 @@ def wa_handle_button(wa_phone: str, button_id: str) -> None:
                 "Send a voice message to start."
             ),
             buttons=[
-                {"id": "btn_stop",    "title": "⏹ Stop Meeting"},
-                {"id": "btn_swap",    "title": "🔄 Swap langs"},
-                {"id": "btn_back",    "title": "← Back"},
+                {"id": "btn_stop",     "title": "⏹ Stop Meeting"},
+                {"id": "btn_newpair",  "title": "🔄 New pair"},
+                {"id": "btn_back",     "title": "← Back"},
             ],
         )
 
@@ -2125,8 +2125,17 @@ def wa_handle_button(wa_phone: str, button_id: str) -> None:
     elif button_id in ("btn_stop", "btn_back"):
         wa_send_main_menu(wa_phone)
 
-    elif button_id == "btn_swap":
-        wa_send_text(wa_phone, "🔄 Languages swapped! Send a voice message to continue.")
+    elif button_id == "btn_newpair":
+        # Сбрасываем пару языков — следующая фраза с командой задаст новую
+        with SessionLocal() as db:
+            user = db.query(User).filter(User.wa_phone == wa_phone).first()
+            if user:
+                user.conversation_source_lang = None
+                user.conversation_target_lang = None
+                user.updated_at = datetime.utcnow()
+                db.commit()
+        wa_send_text(wa_phone, "🔄 Language pair reset!\n\nSay a voice message with a new language command, e.g.:\n\"Translate to Spanish, hello how are you?\"")
+        wa_send_main_menu(wa_phone)
 
     else:
         log.warning(f"WhatsApp: unknown button_id={button_id} from {wa_phone}")
