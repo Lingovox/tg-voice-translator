@@ -2022,6 +2022,9 @@ def wa_set_language(wa_phone: str, lang_code: str) -> None:
         user = db.query(User).filter(User.wa_phone == wa_phone).first()
         if user:
             user.target_lang = lang_code
+            # Сбрасываем conversation пару — иначе старая пара имеет приоритет
+            user.conversation_source_lang = None
+            user.conversation_target_lang = None
             user.updated_at = datetime.utcnow()
             db.commit()
     lang_display = lang_name(lang_code)
