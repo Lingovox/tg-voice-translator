@@ -1941,11 +1941,24 @@ def wa_process_voice(wa_phone: str, message: dict) -> None:
 
         log.info(f"WA voice from {wa_phone}: transcript={transcript!r}")
 
-        # Определяем язык входящего и переводим
-        source_lang = detect_language_name(transcript)
-        target_lang = lang_name(user.target_lang)
+        # Парсим команду из голосового ("переведи на грузинский, как дела?")
+        setup = parse_conversation_setup(transcript)
+        if setup["has_command"] and setup["target_lang"]:
+            text_to_translate = setup["message_text"] or transcript
+            target_lang = setup["target_lang"]
+            # Сохраняем новый target_lang в БД
+            norm = normalize_lang_code(target_lang)
+            if norm:
+                user.target_lang = norm
+                user.updated_at = datetime.utcnow()
+                db.commit()
+        else:
+            text_to_translate = transcript
+            target_lang = lang_name(user.target_lang)
+
+        source_lang = detect_language_name(text_to_translate)
         try:
-            translated = openai_translate_text(transcript, target_lang, source_lang=source_lang)
+            translated = openai_translate_text(text_to_translate, target_lang, source_lang=source_lang)
         except Exception as e:
             log.error(f"wa_process_voice: translate error: {e}")
             wa_send_text(wa_phone, "❌ Translation error. Please try again.")
@@ -1969,7 +1982,7 @@ def wa_process_voice(wa_phone: str, message: dict) -> None:
         balance_left = max(0, int(user.balance_seconds or 0)) // 60
         wa_send_text(
             wa_phone,
-            f"📝 *{source_lang}:* {transcript}\n"
+            f"📝 *{source_lang}:* {text_to_translate}\n"
             f"➡️ *{target_lang}:* {translated}\n\n"
             f"⏱ Balance: {balance_left} min"
         )
