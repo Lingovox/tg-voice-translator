@@ -1229,8 +1229,9 @@ a:hover{{text-decoration:underline}}
 </div>
 {body}
 <div class="footer">
-  © {year} {SITE_NAME} ·
-  <a href="/">Home</a><a href="/blog">Blog</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a>
+  © {year} {SITE_NAME} · Arxipov Stepan (Individual Entrepreneur)
+  <br/>Mirzo-Ulugbek district, Parkent ko'chasi, 231-uy, Tashkent, Uzbekistan
+  <br/><a href="/">Home</a><a href="/blog">Blog</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a>
   <br/>Contact: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>
 </div>
 </div></body></html>"""
