@@ -369,6 +369,19 @@ class UsageEvent(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
 
 
+class TranslationLog(Base):
+    """Каждый успешный перевод — для аналитики по языкам."""
+    __tablename__ = "translation_logs"
+    id = Column(Integer, primary_key=True, index=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    platform = Column(String, nullable=False, default="tg")      # tg | wa
+    source_lang = Column(String, nullable=False)                   # English, Russian, ...
+    target_lang = Column(String, nullable=False)                   # Georgian, Kazakh, ...
+    mode = Column(String, nullable=False, default="translate")     # translate | conversation
+    duration_sec = Column(Integer, nullable=False, default=0)      # длительность голосового
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+
+
 def init_db():
     Base.metadata.create_all(bind=engine)
     with engine.begin() as conn:
@@ -381,6 +394,22 @@ def init_db():
         conn.exec_driver_sql("ALTER TABLE payments ADD COLUMN IF NOT EXISTS external_id VARCHAR")
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS platform VARCHAR DEFAULT 'tg'")
         conn.exec_driver_sql("ALTER TABLE users ADD COLUMN IF NOT EXISTS wa_phone VARCHAR")
+
+
+def log_translation(db, telegram_id: int, platform: str, source_lang: str, target_lang: str, mode: str, duration_sec: int = 0):
+    """Записать перевод в историю для аналитики."""
+    try:
+        db.add(TranslationLog(
+            telegram_id=telegram_id,
+            platform=platform,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            mode=mode,
+            duration_sec=duration_sec,
+        ))
+        db.commit()
+    except Exception as e:
+        log.error(f"log_translation error: {e}")
 
 
 # =========================================================
@@ -1106,6 +1135,10 @@ def process_voice(db, user: "User", chat_id: int, file_id: str, duration: int) -
         seconds=max(MIN_BILLABLE_SECONDS, int(duration)),
     ))
     db.commit()
+    # Логируем перевод для аналитики по языкам
+    src = detect_language_name(transcript)
+    tgt = lang_name(user.conversation_target_lang) if user.mode == "conversation" and user.conversation_target_lang else lang_name(user.target_lang)
+    log_translation(db, chat_id, "tg", src, tgt, user.mode or "translate", max(MIN_BILLABLE_SECONDS, int(duration)))
 
     if b_mode == "trial":
         cap = f"🎁 Trial left: {user.trial_left}"
@@ -1230,7 +1263,7 @@ a:hover{{text-decoration:underline}}
 {body}
 <div class="footer">
   © {year} {SITE_NAME} · Arxipov Stepan (Individual Entrepreneur)
-  <br/>Mirzo-Ulugbek district, Parkent ko'chasi, 231-uy, Tashkent, Uzbekistan
+  <br/>Mirzo-Ulugbek district, Parkent ko\'chasi, 231-uy, Tashkent, Uzbekistan
   <br/><a href="/">Home</a><a href="/blog">Blog</a><a href="/terms">Terms</a><a href="/privacy">Privacy</a>
   <br/>Contact: <a href="mailto:{SUPPORT_EMAIL}">{SUPPORT_EMAIL}</a>
 </div>
@@ -1999,6 +2032,8 @@ def wa_process_voice(wa_phone: str, message: dict) -> None:
 
         # Биллинг
         apply_billing(db, user, b_mode, charge)
+        # Логируем перевод для аналитики
+        log_translation(db, user.telegram_id, "wa", source_lang, target_lang, "conversation" if user.conversation_source_lang else "translate", duration)
 
         # Отправляем результат: сначала текст-лог, потом голосовое
         balance_left = max(0, int(user.balance_seconds or 0)) // 60
