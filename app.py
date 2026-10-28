@@ -2099,7 +2099,8 @@ def wa_show_packages(wa_phone: str) -> None:
             "• 30 min — $10\n"
             "• 60 min — $15\n"
             "• 180 min — $30\n\n"
-            "Choose a package:"
+            "Choose a package:\n"
+            "(type *menu* to go back)"
         ),
         buttons=[
             {"id": "btn_pkg_P30",  "title": "30 min — $10"},
@@ -2185,6 +2186,11 @@ def wa_handle_message(wa_phone: str, message: dict) -> None:
     if msg_type == "text":
         text = message.get("text", {}).get("body", "").strip()
         text_lower = text.lower()
+
+        # Команда "menu" / "back" — вернуться в главное меню
+        if text_lower in ("menu", "back", "назад", "меню", "start"):
+            wa_send_main_menu(wa_phone)
+            return
 
         # Команда "buy" — показать пакеты
         if text_lower in ("buy", "купить", "pay", "оплата"):
