@@ -68,6 +68,7 @@ WA_TOKEN = os.getenv("WA_TOKEN", "").strip()
 WA_PHONE_ID = os.getenv("WA_PHONE_ID", "").strip()
 WA_VERIFY_TOKEN = os.getenv("WA_VERIFY_TOKEN", "lingovox_wa_verify_2024").strip()
 WA_API_URL = f"https://graph.facebook.com/v19.0/{WA_PHONE_ID}/messages"
+WA_PHONE_NUMBER = os.getenv("WA_PHONE_NUMBER", "").strip()  # e.g. 15551234567 for wa.me link
 
 # Смещение часового пояса для границы "сегодня" в статистике (Ташкент = +5)
 STAT_TZ_OFFSET = int(os.getenv("STAT_TZ_OFFSET", "5"))
@@ -924,11 +925,20 @@ def credit_payment_if_needed(db, payment: "Payment") -> bool:
     db.add(payment)
     db.commit()
     db.refresh(user)
-    tg_send_message(
-        int(user.telegram_id),
-        t("pay_received", ui_of(user), min=pkg["minutes"]),
-        reply_markup=user_keyboard(user),
-    )
+    # Уведомляем пользователя на нужной платформе
+    if user.platform == "wa" and user.wa_phone:
+        wa_send_text(
+            user.wa_phone,
+            f"✅ Payment received! *{pkg['minutes']} minutes* added.\n\n"
+            f"🎙 Your balance: {max(0, int(user.balance_seconds or 0)) // 60} min\n\n"
+            "Send a voice message to start translating!"
+        )
+    else:
+        tg_send_message(
+            int(user.telegram_id),
+            t("pay_received", ui_of(user), min=pkg["minutes"]),
+            reply_markup=user_keyboard(user),
+        )
     return True
 
 
@@ -1234,8 +1244,11 @@ a:hover{{text-decoration:underline}}
 .hero{{text-align:center;padding:48px 16px 28px}}
 .hero h1{{font-size:40px;line-height:1.15;margin:0 0 14px}}
 .hero p{{font-size:18px;color:var(--muted);max-width:560px;margin:0 auto 26px}}
+.btn-row{{display:flex;gap:14px;justify-content:center;flex-wrap:wrap}}
 .btn{{display:inline-block;background:var(--accent);color:#fff;padding:14px 30px;border-radius:12px;font-weight:600;font-size:16px}}
 .btn:hover{{background:#2f5fd6;text-decoration:none}}
+.btn-wa{{background:#25D366}}
+.btn-wa:hover{{background:#1da851}}
 .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin:36px 0}}
 .feat{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px}}
 .feat h3{{margin:0 0 8px;font-size:17px}}
@@ -1278,6 +1291,7 @@ def healthz():
 @app.get("/", response_class=HTMLResponse)
 def landing():
     bot_link = f"https://t.me/{BOT_USERNAME}" if BOT_USERNAME else "#"
+    wa_link = f"https://wa.me/{WA_PHONE_NUMBER}" if WA_PHONE_NUMBER else "https://wa.me/998503022947"
     langs = ", ".join(name for name, _ in LANGS)
 
     price_cards = ""
@@ -1290,11 +1304,16 @@ def landing():
             f'<div class="per">${per:.2f} / min</div></div>'
         )
 
+    wa_btn = f'  <a class="btn btn-wa" href="{wa_link}">WhatsApp →</a>' if wa_link else ""
+
     body = f"""
 <div class="hero">
   <h1>Speak any language.<br/>Be understood instantly.</h1>
-  <p>Lingovox is an AI voice translator in Telegram. Send a voice message — get a natural voice translation back in seconds.</p>
-  <a class="btn" href="{bot_link}">Start translating →</a>
+  <p>Lingovox is an AI voice translator for Telegram and WhatsApp. Send a voice message — get a natural voice translation back in seconds.</p>
+  <div class="btn-row">
+    <a class="btn" href="{bot_link}">Telegram →</a>
+{wa_btn}
+  </div>
 </div>
 
 <div class="grid">
@@ -1311,7 +1330,10 @@ def landing():
 <div class="langs"><b>Popular target languages:</b><br/>{langs} — and many more in conversation mode.</div>
 
 <div class="hero" style="padding-top:8px">
-  <a class="btn" href="{bot_link}">Open Lingovox in Telegram</a>
+  <div class="btn-row">
+    <a class="btn" href="{bot_link}">Open in Telegram</a>
+{wa_btn}
+  </div>
 </div>
 """
     return HTMLResponse(content=_page("AI voice translator", body))
@@ -2068,6 +2090,85 @@ def wa_set_language(wa_phone: str, lang_code: str) -> None:
     wa_send_main_menu(wa_phone)
 
 
+def wa_show_packages(wa_phone: str) -> None:
+    """Показать пакеты минут как Reply Buttons (макс. 3)."""
+    wa_send_buttons(
+        to=wa_phone,
+        body=(
+            "💳 *Buy translation minutes*\n\n"
+            "• 30 min — $10\n"
+            "• 60 min — $15\n"
+            "• 180 min — $30\n\n"
+            "Choose a package:"
+        ),
+        buttons=[
+            {"id": "btn_pkg_P30",  "title": "30 min — $10"},
+            {"id": "btn_pkg_P60",  "title": "60 min — $15"},
+            {"id": "btn_pkg_P180", "title": "180 min — $30"},
+        ],
+    )
+
+
+def wa_handle_card_purchase(wa_phone: str, package_code: str) -> None:
+    """Создать Paddle-транзакцию и отправить ссылку на оплату в WhatsApp."""
+    pkg = PACKAGES.get(package_code)
+    if not pkg:
+        wa_send_text(wa_phone, "❌ Unknown package. Please try again.")
+        return
+
+    missing = paddle_env_missing()
+    if missing:
+        wa_send_text(wa_phone, "❌ Payment system is not configured. Please try later.")
+        return
+
+    # Получаем telegram_id (PK) пользователя WA
+    with SessionLocal() as db:
+        user = db.query(User).filter(User.wa_phone == wa_phone).first()
+        if not user:
+            wa_send_text(wa_phone, "❌ Please send a voice message first to activate your account.")
+            return
+        tg_id = user.telegram_id
+
+        try:
+            res = paddle_create_transaction(package_code, tg_id)
+        except Exception as e:
+            log.warning("WA Paddle transaction error: %s", e)
+            wa_send_text(wa_phone, "❌ Could not create payment. Please try later.")
+            return
+
+        if not res.get("ok"):
+            log.warning("WA Paddle transaction failed: %s", res)
+            wa_send_text(wa_phone, "❌ Could not create payment. Please try later.")
+            return
+
+        tx = (res.get("data") or {}).get("data") or {}
+        tx_id = str(tx.get("id") or "")
+        checkout = (tx.get("checkout") or {}).get("url") or ""
+
+        p = Payment(
+            telegram_id=tg_id,
+            order_id=res.get("order_id", f"pdl_{tg_id}_{int(time.time())}"),
+            invoice_id=tx_id,
+            package_code=package_code,
+            amount_usd=int(pkg["usd"]),
+            provider="paddle",
+            external_id=tx_id,
+            status="created",
+        )
+        db.add(p)
+        db.commit()
+
+    if checkout:
+        wa_send_text(
+            wa_phone,
+            f"💳 *{pkg['minutes']} minutes — ${pkg['usd']}*\n\n"
+            f"Open this link to pay:\n{checkout}\n\n"
+            "✅ Minutes will be added automatically after payment."
+        )
+    else:
+        wa_send_text(wa_phone, "❌ Could not create payment link. Please try later.")
+
+
 def wa_handle_message(wa_phone: str, message: dict) -> None:
     """Основная точка входа для обработки входящего сообщения WhatsApp."""
     msg_type = message.get("type")
@@ -2083,6 +2184,31 @@ def wa_handle_message(wa_phone: str, message: dict) -> None:
     # Текстовое сообщение
     if msg_type == "text":
         text = message.get("text", {}).get("body", "").strip()
+        text_lower = text.lower()
+
+        # Команда "buy" — показать пакеты
+        if text_lower in ("buy", "купить", "pay", "оплата"):
+            wa_show_packages(wa_phone)
+            return
+
+        # Команда "help" — справка
+        if text_lower in ("help", "помощь", "info"):
+            wa_send_text(
+                wa_phone,
+                "ℹ️ *How LingoVox works*\n\n"
+                "1️⃣ Send a voice message — I'll detect the language and translate it\n"
+                "2️⃣ You'll get back a translated voice + text\n"
+                "3️⃣ Forward the voice reply to your contact\n\n"
+                "🎙 *Live Meeting mode* — place your phone on the table, "
+                "take turns speaking — I translate both sides in real time\n\n"
+                "🇬🇪 Georgian • 🇰🇿 Kazakh • 🇺🇿 Uzbek voice supported "
+                "(Google Translate doesn't support these!)\n\n"
+                "💳 Type *buy* to purchase minutes\n"
+                "Questions? Contact @arkhipov_stepan"
+            )
+            wa_send_main_menu(wa_phone)
+            return
+
         lang_code = find_language_code_in_text(text)
         if lang_code:
             wa_set_language(wa_phone, lang_code)
@@ -2111,7 +2237,7 @@ def wa_send_main_menu(wa_phone: str) -> None:
         buttons=[
             {"id": "btn_meeting", "title": "👥 Live Meeting"},
             {"id": "btn_language", "title": "🌍 Language"},
-            {"id": "btn_help",    "title": "ℹ️ Help"},
+            {"id": "btn_buy",     "title": "💳 Buy minutes"},
         ],
     )
 
@@ -2144,19 +2270,13 @@ def wa_handle_button(wa_phone: str, button_id: str) -> None:
             "Example: just type *Georgian*"
         )
 
-    elif button_id == "btn_help":
-        wa_send_text(
-            wa_phone,
-            "ℹ️ *How LingoVox works*\n\n"
-            "1️⃣ Send a voice message — I'll detect the language and translate it\n"
-            "2️⃣ You'll get back a translated voice + text\n"
-            "3️⃣ Forward the voice reply to your contact\n\n"
-            "🎙 *Live Meeting mode* — place your phone on the table, "
-            "take turns speaking — I translate both sides in real time\n\n"
-            "🇬🇪 Georgian • 🇰🇿 Kazakh • 🇺🇿 Uzbek voice supported "
-            "(Google Translate doesn't support these!)\n\n"
-            "Questions? Contact @arkhipov_stepan"
-        )
+    elif button_id == "btn_buy":
+        wa_show_packages(wa_phone)
+
+    elif button_id.startswith("btn_pkg_"):
+        # btn_pkg_P60, btn_pkg_P180, btn_pkg_P600
+        package_code = button_id.replace("btn_pkg_", "")
+        wa_handle_card_purchase(wa_phone, package_code)
 
     elif button_id in ("btn_stop", "btn_back"):
         wa_send_main_menu(wa_phone)
