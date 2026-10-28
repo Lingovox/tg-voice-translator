@@ -1255,6 +1255,7 @@ def _page(title: str, body: str) -> str:
     return f"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta name="facebook-domain-verification" content="csn3w2l09sswhq2ribpqhp89cthdfr6" />
 <title>{title} — {SITE_NAME}</title>
 <style>
 :root{{--bg:#0b1020;--card:#121a33;--ink:#e9eefc;--muted:#9fb0d8;--accent:#3b6ef0;--accent2:#7aa2ff;--line:#23304f}}
