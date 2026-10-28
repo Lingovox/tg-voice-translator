@@ -43,7 +43,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OPENAI_TEXT_MODEL = os.getenv("OPENAI_TEXT_MODEL", "gpt-5.4-mini").strip()
 OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "alloy").strip()
 # Распознавание речи: основной движок и запасной (включается, если основной выдал кашу)
-STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe").strip()
+STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-mini-transcribe").strip()
 STT_FALLBACK_MODEL = os.getenv("STT_FALLBACK_MODEL", "whisper-1").strip()
 
 # ---- Payments (только карта через Paddle) ----
