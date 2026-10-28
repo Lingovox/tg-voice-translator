@@ -1847,6 +1847,26 @@ async def whatsapp_webhook(request: Request):
 # WhatsApp — helpers и логика
 # =========================================================
 
+_wa_token_alert_sent = False  # чтобы не спамить админу
+
+def _wa_notify_token_expired(status_code: int):
+    """Уведомить админа в Telegram, что WA-токен протух."""
+    global _wa_token_alert_sent
+    if _wa_token_alert_sent or not ADMIN_ID:
+        return
+    if status_code == 401:
+        _wa_token_alert_sent = True
+        try:
+            tg_send_message(
+                int(ADMIN_ID),
+                "🚨 *WhatsApp token expired!*\n\n"
+                "Got 401 from Meta API.\n"
+                "Regenerate token in Graph API Explorer and update WA_TOKEN on Render."
+            )
+        except Exception:
+            pass
+
+
 def wa_send_text(to: str, text: str) -> None:
     """Отправить текстовое сообщение."""
     if not WA_TOKEN or not WA_PHONE_ID:
@@ -1866,6 +1886,7 @@ def wa_send_text(to: str, text: str) -> None:
     )
     if not resp.ok:
         log.error(f"wa_send_text error {resp.status_code}: {resp.text}")
+        _wa_notify_token_expired(resp.status_code)
 
 
 def wa_send_buttons(to: str, body: str, buttons: list) -> None:
@@ -1897,6 +1918,7 @@ def wa_send_buttons(to: str, body: str, buttons: list) -> None:
     )
     if not resp.ok:
         log.error(f"wa_send_buttons error {resp.status_code}: {resp.text}")
+        _wa_notify_token_expired(resp.status_code)
 
 
 def wa_download_audio(media_id: str) -> bytes:
