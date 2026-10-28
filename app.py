@@ -1089,22 +1089,47 @@ def build_today_stats(db) -> str:
     )
     revenue = sum(int(p.amount_usd or 0) for p in paid_today)
 
+    # По платформам (WA-юзеры имеют отрицательный telegram_id)
+    wa_translations = (
+        db.query(func.count(UsageEvent.id))
+        .filter(in_today(UsageEvent.created_at), UsageEvent.telegram_id < 0)
+        .scalar() or 0
+    )
+    tg_translations = translations - wa_translations
+
+    wa_active = (
+        db.query(func.count(func.distinct(UsageEvent.telegram_id)))
+        .filter(in_today(UsageEvent.created_at), UsageEvent.telegram_id < 0)
+        .scalar() or 0
+    )
+    tg_active = active_users - wa_active
+
     # Всего (для контекста)
     total_users = db.query(func.count(User.telegram_id)).scalar() or 0
+    total_wa = db.query(func.count(User.telegram_id)).filter(User.platform == "wa").scalar() or 0
+    total_tg = total_users - total_wa
+
+    # Новые по платформам
+    new_wa = (
+        db.query(func.count(User.telegram_id))
+        .filter(in_today(User.created_at), User.platform == "wa")
+        .scalar() or 0
+    )
+    new_tg = new_users - new_wa
 
     minutes_used = seconds_used // 60
     return (
         "📊 Статистика за сегодня\n"
         f"(день по UTC+{STAT_TZ_OFFSET})\n\n"
-        f"👥 Активных юзеров: {active_users}\n"
-        f"🆕 Новых юзеров: {new_users}\n"
-        f"🎙 Переводов: {translations}\n"
+        f"👥 Активных юзеров: {active_users} (TG: {tg_active}, WA: {wa_active})\n"
+        f"🆕 Новых юзеров: {new_users} (TG: {new_tg}, WA: {new_wa})\n"
+        f"🎙 Переводов: {translations} (TG: {tg_translations}, WA: {wa_translations})\n"
         f"   ├ trial: {trial_cnt}\n"
         f"   ├ платных: {paid_cnt}\n"
         f"   └ в режиме диалога: {conv_cnt}\n"
         f"⏱ Использовано: ~{minutes_used} мин\n"
         f"💳 Оплат: {len(paid_today)} на ${revenue}\n\n"
-        f"Всего юзеров в базе: {total_users}"
+        f"Всего юзеров: {total_users} (TG: {total_tg}, WA: {total_wa})"
     )
 
 
